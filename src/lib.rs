@@ -1,15 +1,19 @@
-use core::ffi::{c_char, c_void};
-use core::ptr;
-
-use ngx::core::{Pool, Status};
-use ngx::ffi::{
-    NGX_CONF_TAKE1, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF_OFFSET, NGX_HTTP_UPS_CONF, NGX_LOG_EMERG,
-    ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_http_upstream_init_round_robin,
-    ngx_http_upstream_srv_conf_t, ngx_int_t, ngx_module_t, ngx_str_t, ngx_uint_t,
+use core::{
+    ffi::{c_char, c_void},
+    ptr,
 };
-use ngx::http::{HttpModule, Merge, MergeConfigError};
-use ngx::http::{HttpModuleServerConf, NgxHttpUpstreamModule};
-use ngx::{ngx_conf_log_error, ngx_string};
+
+use ngx::{
+    core::{Pool, Status},
+    ffi::{
+        NGX_CONF_TAKE1, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF_OFFSET, NGX_HTTP_UPS_CONF,
+        NGX_LOG_EMERG, ngx_command_t, ngx_conf_t, ngx_http_module_t,
+        ngx_http_upstream_init_round_robin, ngx_http_upstream_srv_conf_t, ngx_int_t, ngx_module_t,
+        ngx_str_t, ngx_uint_t,
+    },
+    http::{HttpModule, HttpModuleServerConf, Merge, MergeConfigError, NgxHttpUpstreamModule},
+    ngx_conf_log_error, ngx_string,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
