@@ -4,14 +4,13 @@ use core::{
 };
 
 use ngx::{
-    core::{Pool, Status},
+    core::Pool,
     ffi::{
         NGX_CONF_TAKE1, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF_OFFSET, NGX_HTTP_UPS_CONF,
-        NGX_LOG_EMERG, ngx_command_t, ngx_conf_t, ngx_http_module_t,
-        ngx_http_upstream_init_round_robin, ngx_http_upstream_srv_conf_t, ngx_int_t, ngx_module_t,
-        ngx_str_t, ngx_uint_t,
+        NGX_LOG_EMERG, ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_module_t, ngx_str_t,
+        ngx_uint_t,
     },
-    http::{HttpModule, HttpModuleServerConf, Merge, MergeConfigError, NgxHttpUpstreamModule},
+    http::{HttpModule, HttpModuleServerConf, Merge, MergeConfigError},
     ngx_conf_log_error, ngx_string,
 };
 
@@ -71,22 +70,6 @@ pub static mut ngx_http_balancer_rs_module: ngx_module_t = ngx_module_t {
     ..ngx_module_t::default()
 };
 
-unsafe extern "C" fn ngx_http_balancer_rs_init_upstream(
-    cf: *mut ngx_conf_t,
-    us: *mut ngx_http_upstream_srv_conf_t,
-) -> ngx_int_t {
-    if unsafe { ngx_http_upstream_init_round_robin(cf, us) } != Status::NGX_OK.into() {
-        ngx_conf_log_error!(
-            NGX_LOG_EMERG,
-            cf,
-            "balancer_rs: original init_upstream failed"
-        );
-        return isize::from(Status::NGX_ERROR);
-    }
-
-    isize::from(Status::NGX_OK)
-}
-
 unsafe extern "C" fn ngx_http_balancer_rs_commands_set(
     cf: *mut ngx_conf_t,
     cmd: *mut ngx_command_t,
@@ -96,7 +79,6 @@ unsafe extern "C" fn ngx_http_balancer_rs_commands_set(
     let args: &[ngx_str_t] = unsafe { (*cf.args).as_slice() };
 
     let ccf = unsafe { &mut *conf.cast::<BalancerConfig>() };
-
     let Some(value) = args.get(1) else {
         ngx_conf_log_error!(NGX_LOG_EMERG, cf, "balancer_rs: missing policy argument");
         return ngx::core::NGX_CONF_ERROR;
@@ -115,9 +97,6 @@ unsafe extern "C" fn ngx_http_balancer_rs_commands_set(
         );
         return ngx::core::NGX_CONF_ERROR;
     };
-
-    let uscf = NgxHttpUpstreamModule::server_conf_mut(cf).expect("http upstream srv conf");
-    uscf.peer.init_upstream = Some(ngx_http_balancer_rs_init_upstream);
 
     ngx::core::NGX_CONF_OK
 }
