@@ -4,9 +4,8 @@ use core::ptr;
 use ngx::core::{Pool, Status};
 use ngx::ffi::{
     NGX_CONF_TAKE1, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF_OFFSET, NGX_HTTP_UPS_CONF, NGX_LOG_EMERG,
-    ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_http_upstream_init_pt,
-    ngx_http_upstream_init_round_robin, ngx_http_upstream_srv_conf_t, ngx_int_t, ngx_module_t,
-    ngx_str_t, ngx_uint_t,
+    ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_http_upstream_init_round_robin,
+    ngx_http_upstream_srv_conf_t, ngx_int_t, ngx_module_t, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{HttpModule, Merge, MergeConfigError};
 use ngx::http::{HttpModuleServerConf, NgxHttpUpstreamModule};
@@ -22,24 +21,23 @@ enum Policy {
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
-struct SrvConfig {
+struct BalancerConfig {
     policy: Policy,
-    original_init_upstream: ngx_http_upstream_init_pt,
 }
 
-impl Merge for SrvConfig {
-    fn merge(&mut self, _prev: &SrvConfig) -> Result<(), MergeConfigError> {
+impl Merge for BalancerConfig {
+    fn merge(&mut self, _prev: &BalancerConfig) -> Result<(), MergeConfigError> {
         Ok(())
     }
 }
 
 static NGX_HTTP_BALANCER_RS_CTX: ngx_http_module_t = ngx_http_module_t {
-    preconfiguration: Some(Module::preconfiguration),
-    postconfiguration: Some(Module::postconfiguration),
+    preconfiguration: Some(Balancer::preconfiguration),
+    postconfiguration: Some(Balancer::postconfiguration),
     create_main_conf: None,
     init_main_conf: None,
-    create_srv_conf: Some(Module::create_srv_conf),
-    merge_srv_conf: Some(Module::merge_srv_conf),
+    create_srv_conf: Some(Balancer::create_srv_conf),
+    merge_srv_conf: Some(Balancer::merge_srv_conf),
     create_loc_conf: None,
     merge_loc_conf: None,
 };
@@ -73,17 +71,7 @@ unsafe extern "C" fn ngx_http_balancer_rs_init_upstream(
     cf: *mut ngx_conf_t,
     us: *mut ngx_http_upstream_srv_conf_t,
 ) -> ngx_int_t {
-    let us = unsafe { &mut *us };
-    let Some(hccf) = Module::server_conf_mut(us) else {
-        ngx_conf_log_error!(NGX_LOG_EMERG, cf, "balancer_rs: missing upstream srv_conf");
-        return isize::from(Status::NGX_ERROR);
-    };
-
-    let init_upstream_ptr = hccf
-        .original_init_upstream
-        .unwrap_or(ngx_http_upstream_init_round_robin);
-
-    if unsafe { init_upstream_ptr(cf, us) } != Status::NGX_OK.into() {
+    if unsafe { ngx_http_upstream_init_round_robin(cf, us) } != Status::NGX_OK.into() {
         ngx_conf_log_error!(
             NGX_LOG_EMERG,
             cf,
@@ -103,7 +91,7 @@ unsafe extern "C" fn ngx_http_balancer_rs_commands_set(
     let cf = unsafe { &mut *cf };
     let args: &[ngx_str_t] = unsafe { (*cf.args).as_slice() };
 
-    let ccf = unsafe { &mut *conf.cast::<SrvConfig>() };
+    let ccf = unsafe { &mut *conf.cast::<BalancerConfig>() };
 
     let Some(value) = args.get(1) else {
         ngx_conf_log_error!(NGX_LOG_EMERG, cf, "balancer_rs: missing policy argument");
@@ -125,28 +113,21 @@ unsafe extern "C" fn ngx_http_balancer_rs_commands_set(
     };
 
     let uscf = NgxHttpUpstreamModule::server_conf_mut(cf).expect("http upstream srv conf");
-
-    ccf.original_init_upstream = if uscf.peer.init_upstream.is_some() {
-        uscf.peer.init_upstream
-    } else {
-        Some(ngx_http_upstream_init_round_robin)
-    };
-
     uscf.peer.init_upstream = Some(ngx_http_balancer_rs_init_upstream);
 
     ngx::core::NGX_CONF_OK
 }
 
-struct Module;
+struct Balancer;
 
-impl HttpModule for Module {
+impl HttpModule for Balancer {
     fn module() -> &'static ngx_module_t {
         unsafe { &*::core::ptr::addr_of!(ngx_http_balancer_rs_module) }
     }
 
     unsafe extern "C" fn create_srv_conf(cf: *mut ngx_conf_t) -> *mut c_void {
         let pool = unsafe { Pool::from_ngx_pool((*cf).pool) };
-        let conf = pool.alloc_type::<SrvConfig>();
+        let conf = pool.alloc_type::<BalancerConfig>();
         if conf.is_null() {
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
@@ -160,6 +141,6 @@ impl HttpModule for Module {
     }
 }
 
-unsafe impl HttpModuleServerConf for Module {
-    type ServerConf = SrvConfig;
+unsafe impl HttpModuleServerConf for Balancer {
+    type ServerConf = BalancerConfig;
 }
