@@ -1,0 +1,17 @@
+[package]
+name = "ngx-balancer-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ngx = { git = "https://github.com/nginx/ngx-rust", branch = "main", features = ["vendored"] }
+
+[features]
+export-modules = []
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

@@ -1,0 +1,7 @@
+{
+    "rust-analyzer.cargo.features": [
+        "export-modules"
+    ],
+    "rust-analyzer.check.command": "clippy",
+    "rust-analyzer.trace.server": "verbose",
+}
