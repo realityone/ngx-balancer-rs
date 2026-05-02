@@ -57,12 +57,10 @@ static mut NGX_HTTP_BALANCER_RS_COMMANDS: [ngx_command_t; 2] = [
     ngx_command_t::empty(),
 ];
 
-#[cfg(feature = "export-modules")]
 ngx::ngx_modules!(ngx_http_balancer_rs_module);
 
 #[used]
 #[allow(non_upper_case_globals)]
-#[cfg_attr(not(feature = "export-modules"), unsafe(no_mangle))]
 pub static mut ngx_http_balancer_rs_module: ngx_module_t = ngx_module_t {
     ctx: &raw const NGX_HTTP_BALANCER_RS_CTX as _,
     commands: unsafe { &raw mut NGX_HTTP_BALANCER_RS_COMMANDS[0] },

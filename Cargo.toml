@@ -4,11 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ngx = { git = "https://github.com/nginx/ngx-rust", branch = "main", features = ["vendored"] }
+ngx = { git = "https://github.com/nginx/ngx-rust", branch = "main", features = [
+    "vendored",
+] }
 
-[features]
-default = ["export-modules"]
-export-modules = []
 
 [lib]
 crate-type = ["cdylib"]
