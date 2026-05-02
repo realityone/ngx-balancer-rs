@@ -118,6 +118,8 @@ impl HttpModule for Balancer {
             return ptr::null_mut();
         }
 
+        unsafe { (*conf).policy = Policy::Unset };
+
         conf.cast::<c_void>()
     }
 }
