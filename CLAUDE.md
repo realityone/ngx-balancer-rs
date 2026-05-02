@@ -6,9 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Rust-implemented NGINX HTTP **upstream** module, packaged as a dynamic
 module (`cdylib`). Adds an `upstream { ... }`-context directive
-`balancer_rs <policy>;` (currently only `least_conn` is parsed; the
-actual peer selection still delegates to `ngx_http_upstream_init_round_robin`
-— the policy enum is wired but not yet routed). Built against
+`balancer_rs <policy>;` — currently `least_conn` is the only accepted
+value. The directive is **inert today**: the policy is parsed and
+stored in `BalancerConfig`, but no `peer.init_upstream` hook is
+installed, so nginx falls back to its default round-robin path without
+any of our code running on the data path. Wiring per-policy behavior is
+the next step. Built against
 [`ngx-rust`](https://github.com/nginx/ngx-rust) (`main` branch, `vendored`
 feature — the build script downloads and compiles a full nginx from source).
 
@@ -34,30 +37,30 @@ Everything lives in `src/lib.rs`. The shape mirrors `ngx-rust`'s
 checkout of ngx-rust sits at `~/.cargo/git/checkouts/ngx-rust-*/` if you
 need to read its source.
 
-The module wires two FFI callbacks:
+Today there is one FFI callback:
+`ngx_http_balancer_rs_commands_set` runs at config-parse time when
+nginx encounters `balancer_rs <policy>;`. It validates the argument
+and stores the resulting `Policy` in `BalancerConfig` (the
+per-`upstream {}` server conf). Returning `NGX_CONF_ERROR` aborts
+startup with the logged message.
 
-1. **Config-parse time** — `ngx_http_balancer_rs_commands_set` runs when
-   nginx parses `balancer_rs least_conn;`. It validates the policy
-   argument, stores it in `BalancerConfig` (the per-`upstream {}` server
-   conf), and swaps `uscf.peer.init_upstream` to our wrapper. Returning
-   `NGX_CONF_ERROR` aborts startup with the logged message.
-
-2. **Upstream-init time** — `ngx_http_balancer_rs_init_upstream` runs
-   later, after all `server` directives in the upstream block are
-   collected. Currently it just delegates to the round-robin initializer.
-   Real per-policy logic should branch off `BalancerConfig.policy` here.
+To make the directive actually do something, add an
+`unsafe extern "C" fn` matching `ngx_http_upstream_init_pt`, install it
+via `uscf.peer.init_upstream = Some(...)` inside the commands callback
+(re-importing `NgxHttpUpstreamModule::server_conf_mut`), and inside it
+either call `ngx_http_upstream_init_round_robin` then patch
+`peer.init` for per-request routing, or set up a custom peer init from
+scratch. The earlier git history (`git log -- src/lib.rs`) has the
+wrapper shape we used before.
 
 `Balancer` (ZST) implements `HttpModule` and `HttpModuleServerConf` so
 ngx-rust generates the boilerplate `create_srv_conf` / `merge_srv_conf`
 shims that the static `NGX_HTTP_BALANCER_RS_CTX` references.
 
-## Feature flags
-
-`export-modules` is in the **default** feature set. It emits the
-`ngx_modules` symbol that nginx's `dlsym` looks up at `load_module` time.
-Without it the `.so` loads but nginx errors with
-`undefined symbol: ngx_modules`. Pass `--no-default-features` only when
-statically linking via `--add-module=...`.
+The `ngx::ngx_modules!(...)` invocation at the top level is
+**load-bearing** — it emits the `ngx_modules` symbol that nginx's
+`dlsym` looks up at `load_module` time. Removing it (or gating it
+behind a cfg) breaks dynamic loading with `undefined symbol: ngx_modules`.
 
 ## Test::Nginx harness gotchas
 
@@ -75,9 +78,9 @@ statically linking via `--add-module=...`.
 
 ## Editor
 
-`.vscode/settings.json` enables the `export-modules` feature for
-rust-analyzer and routes `rust-analyzer.check.command` through clippy.
-After any feature change, restart the rust-analyzer server.
+`.vscode/settings.json` routes `rust-analyzer.check.command` through
+clippy so warnings show up inline. After any cargo-feature or build-script
+change, restart the rust-analyzer server.
 
 rust-analyzer is stricter than rustc about chained coercions (fn-item →
 fn-pointer + safe → unsafe). If r-a flags an FFI assignment that rustc
