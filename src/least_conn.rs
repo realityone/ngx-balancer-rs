@@ -33,10 +33,7 @@ unsafe extern "C" fn init_peer(
     todo!()
 }
 
-unsafe extern "C" fn get_peer(
-    _pc: *mut ngx_peer_connection_t,
-    _data: *mut c_void,
-) -> ngx_int_t {
+unsafe extern "C" fn get_peer(_pc: *mut ngx_peer_connection_t, _data: *mut c_void) -> ngx_int_t {
     todo!()
 }
 
