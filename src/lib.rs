@@ -10,9 +10,14 @@ use ngx::{
         NGX_LOG_EMERG, ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_module_t, ngx_str_t,
         ngx_uint_t,
     },
-    http::{HttpModule, HttpModuleServerConf, Merge, MergeConfigError},
+    http::{HttpModule, HttpModuleServerConf, Merge, MergeConfigError, NgxHttpUpstreamModule},
     ngx_conf_log_error, ngx_string,
 };
+
+mod least_conn;
+mod policy;
+
+use crate::{least_conn::LeastConn, policy::BalancingPolicy};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -94,6 +99,12 @@ unsafe extern "C" fn ngx_http_balancer_rs_commands_set(
             unsafe { &(*cmd).name }
         );
         return ngx::core::NGX_CONF_ERROR;
+    };
+
+    let uscf = NgxHttpUpstreamModule::server_conf_mut(cf).expect("http upstream srv conf");
+    uscf.peer.init_upstream = match ccf.policy {
+        Policy::LeastConn => LeastConn::init_upstream(),
+        Policy::Unset => None,
     };
 
     ngx::core::NGX_CONF_OK
