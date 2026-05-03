@@ -23,10 +23,6 @@ mod policy;
 
 use crate::{ewma::Ewma, least_conn::LeastConn, policy::BalancingPolicy};
 
-/// Tagged union of `BalancingPolicy` impls. Each variant carries the
-/// per-upstream state that policy needs (`Ewma` owns its slot-table
-/// pointer; `LeastConn` is stateless because all its bookkeeping
-/// lives on the existing `rr_peer*` structs).
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 enum PolicyImpl {
@@ -116,9 +112,9 @@ unsafe extern "C" fn ngx_http_balancer_rs_commands_set(
     if uscf.peer.init_upstream.is_some() {
         ngx_conf_log_error!(NGX_LOG_WARN, cf, "load balancing method redefined");
     }
-    // Both policies accept the full set of stock-nginx server params.
-    // We pick a single mask up front because the parser uses these
-    // flags when reading subsequent `server` lines.
+    // The parser uses these flags when reading subsequent `server`
+    // lines, so they must be set before the policy's `init_upstream`
+    // is invoked.
     let policy_flags = (NGX_HTTP_UPSTREAM_CREATE
         | NGX_HTTP_UPSTREAM_MODIFY
         | NGX_HTTP_UPSTREAM_WEIGHT

@@ -77,9 +77,8 @@ http_upstream_init_peer_pt!(
             return Status::NGX_ERROR;
         };
 
-        // `round_robin`'s `init_peer` set `peer.data = rrp` and
-        // `peer.get` / `peer.free` to its own callbacks. We only
-        // override `peer.get` so the existing free path keeps working.
+        // Only `peer.get` is overridden — round_robin's `peer.free`
+        // and `peer.data` (the rrp pointer) keep doing their job.
         unsafe { (*upstream_ptr).peer.get = Some(get_peer) };
 
         Status::NGX_OK
@@ -125,8 +124,6 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
 
     let now = unsafe { (*ngx_cached_time).sec };
 
-    // Walk primary then backup peers. Tail-recursive in the C version;
-    // a loop reads more cleanly here.
     loop {
         let peers_ptr = unsafe { (*rrp).peers };
         if peers_ptr.is_null() {
