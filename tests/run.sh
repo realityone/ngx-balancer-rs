@@ -4,9 +4,17 @@
 # Usage: tests/run.sh [extra prove args...]
 #   TEST_NGINX_VERBOSE=1   show nginx error log output (default on)
 #   TEST_NGINX_LEAVE=1     keep the temp prefix dir after a failed test
+#   TEST_NGINX_NOFILE=1024 open-file limit for nginx workers
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+TEST_NGINX_NOFILE="${TEST_NGINX_NOFILE:-1024}"
+NOFILE_HARD=$(ulimit -Hn)
+if [[ "$NOFILE_HARD" != "unlimited" && "$TEST_NGINX_NOFILE" -gt "$NOFILE_HARD" ]]; then
+    TEST_NGINX_NOFILE=$NOFILE_HARD
+fi
+ulimit -Sn "$TEST_NGINX_NOFILE"
 
 cargo build
 
@@ -55,7 +63,8 @@ fi
 
 export PERL5LIB="$PWD/tests/nginx-tests/lib"
 export TEST_NGINX_BINARY="$NGINX_BIN"
-export TEST_NGINX_GLOBALS="load_module $MODULE_SO;"
+export TEST_NGINX_GLOBALS="worker_rlimit_nofile $TEST_NGINX_NOFILE;
+load_module $MODULE_SO;"
 export TEST_NGINX_VERBOSE="${TEST_NGINX_VERBOSE:-1}"
 
 exec prove "$@" tests/t/
