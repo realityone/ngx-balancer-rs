@@ -10,10 +10,20 @@ cd "$(dirname "$0")/.."
 
 cargo build
 
+# `stat -c` is GNU (Linux), `stat -f` is BSD (macOS). Detect once —
+# if we leave both forms in the per-iteration fallback, GNU stat's
+# `-f` doesn't fail on Linux but means `--file-system`, so it
+# prints filesystem info to stdout and the `||` never fires.
+if stat -c '%Y' /dev/null >/dev/null 2>&1; then
+    stat_mtime() { stat -c '%Y' "$1"; }
+else
+    stat_mtime() { stat -f '%m' "$1"; }
+fi
+
 NGINX_BIN=
 NGINX_MTIME=0
 while IFS= read -r -d '' candidate; do
-    mtime=$(stat -f '%m' "$candidate" 2>/dev/null || stat -c '%Y' "$candidate")
+    mtime=$(stat_mtime "$candidate")
     if (( mtime > NGINX_MTIME )); then
         NGINX_BIN=$candidate
         NGINX_MTIME=$mtime
