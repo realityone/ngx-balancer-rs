@@ -9,6 +9,7 @@ Currently supported policies:
 | Policy       | Behavior |
 | ------------ | -------- |
 | `least_conn` | Picks the available peer with the fewest active connections, weighted. Matches stock nginx's `ngx_http_upstream_least_conn_module` (tie-break by weighted round-robin, primary→backup fallback, `down` / `max_fails` / `max_conns` honored). |
+| `ewma`       | Peak-EWMA + Power-of-Two-Choices, modeled on ingress-nginx's Lua implementation. Each peer's score is an exponentially-weighted moving average of its observed RTT (10s decay constant); on every request we sample two random eligible peers and route to the lower score. Failed attempts (`NGX_PEER_FAILED`) are skipped from the update so a connection-refused doesn't make a dead peer look fast. See [`docs/ewma.md`](docs/ewma.md) for the algorithm in detail. |
 
 ## Build
 
@@ -36,7 +37,7 @@ events {}
 
 http {
     upstream backend {
-        balancer_rs least_conn;
+        balancer_rs least_conn;     # or: balancer_rs ewma;
 
         server 10.0.0.1:8080;
         server 10.0.0.2:8080 weight=2;
@@ -53,8 +54,8 @@ http {
 }
 ```
 
-The `balancer_rs least_conn` directive accepts the same per-`server`
-parameters as the stock module: `weight=`, `max_conns=`, `max_fails=`,
+Both policies accept the same per-`server` parameters as stock
+nginx's `least_conn`: `weight=`, `max_conns=`, `max_fails=`,
 `fail_timeout=`, `down`, `backup`.
 
 `balancer_rs` must appear **before** the `server` lines it should
