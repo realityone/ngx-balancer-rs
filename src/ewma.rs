@@ -19,15 +19,17 @@ use core::{ffi::c_void, ptr};
 use ngx::{
     core::{Pool, Status},
     ffi::{
-        NGX_PEER_FAILED, ngx_cached_time, ngx_conf_t, ngx_current_msec,
+        NGX_PEER_FAILED, ngx_cached_time, ngx_conf_t, ngx_current_msec, ngx_http_add_variable,
         ngx_http_upstream_free_round_robin_peer, ngx_http_upstream_get_round_robin_peer,
         ngx_http_upstream_init_pt, ngx_http_upstream_init_round_robin,
         ngx_http_upstream_init_round_robin_peer, ngx_http_upstream_rr_peer_data_t,
         ngx_http_upstream_rr_peer_t, ngx_http_upstream_rr_peers_t, ngx_http_upstream_srv_conf_t,
-        ngx_int_t, ngx_msec_t, ngx_peer_connection_t, ngx_random, ngx_uint_t, time_t,
+        ngx_http_variable_t, ngx_int_t, ngx_msec_t, ngx_peer_connection_t, ngx_random,
+        ngx_uint_t, ngx_variable_value_t, sockaddr, socklen_t, time_t,
     },
     http::{HttpModuleServerConf, Request},
-    http_upstream_init_peer_pt, ngx_log_debug_http, ngx_log_debug_mask,
+    http_upstream_init_peer_pt, http_variable_get, ngx_log_debug_http, ngx_log_debug_mask,
+    ngx_string,
 };
 
 use crate::{
@@ -68,6 +70,14 @@ impl BalancingPolicy for Ewma {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct EwmaSlot {
+    /// Identity of the peer this slot belongs to. Sockaddr is the
+    /// stable key — peer linked-list positions shift when zone-driven
+    /// peer churn removes entries (see
+    /// `ngx_http_upstream_zone_module.c:ngx_http_upstream_zone_remove_peer_locked`).
+    /// Non-zone configs are static, so the pointer aliases the peer's
+    /// own `sockaddr` for the cycle's lifetime.
+    sockaddr: *mut sockaddr,
+    socklen: socklen_t,
     ewma: f64,
     last_touched_msec: ngx_msec_t,
 }
@@ -86,14 +96,17 @@ struct EwmaConfig {
     backup_len: ngx_uint_t,
 }
 
-/// One eligible peer captured during `collect_available`. Storing
-/// the `peer` pointer alongside the slot index lets `peer.get` skip
-/// the second peers-list walk that an index-only buffer would force.
+/// One eligible peer captured during `collect_available`. Carries
+/// the peer pointer (for `select_peer`), its linked-list position
+/// (for `round_robin`'s `tried[]` bitmap), and a direct slot pointer
+/// so `peer.get` doesn't have to re-resolve the slot for the score
+/// comparison.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct AvailEntry {
-    index: ngx_uint_t,
     peer: *mut ngx_http_upstream_rr_peer_t,
+    peer_index: ngx_uint_t,
+    slot: *mut EwmaSlot,
 }
 
 #[derive(Clone, Copy)]
@@ -103,9 +116,14 @@ struct EwmaPeerData {
     config: *mut EwmaConfig,
     avail_buf: *mut AvailEntry,
     pick_valid: ngx_uint_t,
-    pick_is_backup: ngx_uint_t,
-    pick_index: ngx_uint_t,
+    /// Direct pointer to the chosen peer's slot. Replaces the old
+    /// `(pick_is_backup, pick_index)` pair — robust against future
+    /// peer-list shifts (Phase 3) since slots are sockaddr-keyed.
+    pick_slot: *mut EwmaSlot,
     pick_start_msec: ngx_msec_t,
+    /// Decayed EWMA of the chosen peer at pick time, surfaced via
+    /// `$balancer_ewma_score`. Meaningful only when `pick_valid != 0`.
+    pick_score: f64,
 }
 
 unsafe extern "C" fn init_upstream(
@@ -133,6 +151,7 @@ unsafe extern "C" fn init_upstream(
     let Some(primary_slots) = alloc_slots(&pool, primary_len) else {
         return Status::NGX_ERROR.into();
     };
+    unsafe { stamp_slot_identities(primary, primary_slots, primary_len) };
 
     let backup = unsafe { (*primary).next };
     let (backup_len, backup_slots) = if backup.is_null() {
@@ -142,6 +161,7 @@ unsafe extern "C" fn init_upstream(
         let Some(p) = alloc_slots(&pool, n) else {
             return Status::NGX_ERROR.into();
         };
+        unsafe { stamp_slot_identities(backup, p, n) };
         (n, p)
     };
 
@@ -180,6 +200,60 @@ fn alloc_slots(pool: &Pool, len: ngx_uint_t) -> Option<*mut EwmaSlot> {
     let bytes = len.checked_mul(core::mem::size_of::<EwmaSlot>())?;
     let p = pool.calloc(bytes).cast::<EwmaSlot>();
     if p.is_null() { None } else { Some(p) }
+}
+
+/// Walk `peers` and copy each peer's `(sockaddr, socklen)` into the
+/// matching slot. Slots and peers are 1:1 at init time; once peer
+/// churn (Phase 3) shifts linked-list positions, slots are looked
+/// up by sockaddr instead, so this initial alignment doesn't have
+/// to hold forever.
+unsafe fn stamp_slot_identities(
+    peers: *mut ngx_http_upstream_rr_peers_t,
+    slots: *mut EwmaSlot,
+    len: ngx_uint_t,
+) {
+    if peers.is_null() || slots.is_null() {
+        return;
+    }
+    let mut peer = unsafe { (*peers).peer };
+    let mut i: ngx_uint_t = 0;
+    while !peer.is_null() && i < len {
+        unsafe {
+            (*slots.add(i)).sockaddr = (*peer).sockaddr;
+            (*slots.add(i)).socklen = (*peer).socklen;
+        }
+        peer = unsafe { (*peer).next };
+        i += 1;
+    }
+}
+
+/// Linear scan for the slot owning `(sockaddr, socklen)`. Returns
+/// null if nothing matches. O(N) per call; fleets are typically
+/// <100 peers so this is fine.
+unsafe fn find_slot_by_sockaddr(
+    slots: *mut EwmaSlot,
+    len: ngx_uint_t,
+    sockaddr: *mut sockaddr,
+    socklen: socklen_t,
+) -> *mut EwmaSlot {
+    if slots.is_null() || sockaddr.is_null() || socklen == 0 {
+        return ptr::null_mut();
+    }
+    for i in 0..len {
+        let slot = unsafe { slots.add(i) };
+        let s_addr = unsafe { (*slot).sockaddr };
+        let s_len = unsafe { (*slot).socklen };
+        if s_addr.is_null() || s_len != socklen {
+            continue;
+        }
+        let n = socklen as usize;
+        let a = unsafe { core::slice::from_raw_parts(s_addr.cast::<u8>(), n) };
+        let b = unsafe { core::slice::from_raw_parts(sockaddr.cast::<u8>(), n) };
+        if a == b {
+            return slot;
+        }
+    }
+    ptr::null_mut()
 }
 
 http_upstream_init_peer_pt!(
@@ -306,7 +380,8 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
             }
         };
 
-        let count = unsafe { collect_available(rrp, peers_ptr, now_sec, our) };
+        let count =
+            unsafe { collect_available(rrp, peers_ptr, now_sec, our, slots, slots_len) };
 
         if count == 0 {
             ngx_log_debug_mask!(
@@ -337,19 +412,21 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
             continue;
         }
 
-        let chosen = if count == 1 {
-            unsafe { *(*our).avail_buf }
+        let (chosen, chosen_score) = if count == 1 {
+            let entry = unsafe { *(*our).avail_buf };
+            let score = unsafe { decay_score(entry.slot, now_msec) };
+            (entry, score)
         } else {
-            unsafe { p2c_pick(our, count, slots, slots_len, now_msec) }
+            unsafe { p2c_pick(our, count, now_msec) }
         };
 
-        unsafe { select_peer(pc, rrp, chosen.peer, chosen.index, now_sec) };
+        unsafe { select_peer(pc, rrp, chosen.peer, chosen.peer_index, now_sec) };
 
         unsafe {
             (*our).pick_valid = 1;
-            (*our).pick_is_backup = ngx_uint_t::from(is_backup);
-            (*our).pick_index = chosen.index;
+            (*our).pick_slot = chosen.slot;
             (*our).pick_start_msec = now_msec;
+            (*our).pick_score = chosen_score;
         }
 
         unsafe { peers_wunlock(peers_ptr) };
@@ -391,14 +468,7 @@ unsafe extern "C" fn free_peer(
         if !failed && !stale {
             let now_msec = unsafe { ngx_current_msec };
             let rtt_msec = now_msec.saturating_sub(unsafe { (*our).pick_start_msec });
-            let (slots, len) = unsafe {
-                if (*our).pick_is_backup != 0 {
-                    ((*cfg).backup_slots, (*cfg).backup_len)
-                } else {
-                    ((*cfg).primary_slots, (*cfg).primary_len)
-                }
-            };
-            unsafe { ewma_update(slots, len, (*our).pick_index, rtt_msec, now_msec) };
+            unsafe { ewma_update((*our).pick_slot, rtt_msec, now_msec) };
         }
 
         // Clear the pick so a `proxy_next_upstream` retry doesn't
@@ -413,13 +483,16 @@ unsafe extern "C" fn free_peer(
     }
 }
 
-/// Walk `peers`, push every available index into `our.avail_buf`, and
-/// return the count. Caller holds the peers wlock.
+/// Walk `peers`, push every available peer (with its slot, found by
+/// sockaddr) into `our.avail_buf`, and return the count. Caller
+/// holds the peers wlock.
 unsafe fn collect_available(
     rrp: *mut ngx_http_upstream_rr_peer_data_t,
     peers: *mut ngx_http_upstream_rr_peers_t,
     now_sec: time_t,
     our: *mut EwmaPeerData,
+    slots: *mut EwmaSlot,
+    slots_len: ngx_uint_t,
 ) -> ngx_uint_t {
     let buf = unsafe { (*our).avail_buf };
     let cap = avail_cap(unsafe { (*our).config });
@@ -432,7 +505,16 @@ unsafe fn collect_available(
     let mut index: ngx_uint_t = 0;
     while !peer.is_null() && count < cap {
         if unsafe { peer_available(rrp, peer, index, now_sec) } {
-            unsafe { *buf.add(count) = AvailEntry { index, peer } };
+            let slot = unsafe {
+                find_slot_by_sockaddr(slots, slots_len, (*peer).sockaddr, (*peer).socklen)
+            };
+            unsafe {
+                *buf.add(count) = AvailEntry {
+                    peer,
+                    peer_index: index,
+                    slot,
+                };
+            }
             count += 1;
         }
         peer = unsafe { (*peer).next };
@@ -450,16 +532,14 @@ fn avail_cap(cfg: *mut EwmaConfig) -> ngx_uint_t {
 }
 
 /// Sample two distinct positions from `[0, count)` and return the
-/// `AvailEntry` whose decayed EWMA is lower. Ties go to the first
-/// sample (`i`).
+/// `AvailEntry` whose decayed EWMA is lower, along with that score.
+/// Ties go to the first sample (`i`).
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 unsafe fn p2c_pick(
     our: *mut EwmaPeerData,
     count: ngx_uint_t,
-    slots: *mut EwmaSlot,
-    slots_len: ngx_uint_t,
     now_msec: ngx_msec_t,
-) -> AvailEntry {
+) -> (AvailEntry, f64) {
     // `ngx_random()` is glibc's `random()` — always non-negative and
     // bounded by `RAND_MAX < 2^31`, so the sign-loss / truncation
     // lints are spurious here.
@@ -471,48 +551,136 @@ unsafe fn p2c_pick(
     }
     let a = unsafe { *buf.add(i) };
     let b = unsafe { *buf.add(j) };
-    let score_a = unsafe { decay_score(slots, slots_len, a.index, now_msec) };
-    let score_b = unsafe { decay_score(slots, slots_len, b.index, now_msec) };
-    if score_a <= score_b { a } else { b }
+    let score_a = unsafe { decay_score(a.slot, now_msec) };
+    let score_b = unsafe { decay_score(b.slot, now_msec) };
+    if score_a <= score_b {
+        (a, score_a)
+    } else {
+        (b, score_b)
+    }
 }
 
-/// Read `slots[idx]` and return its EWMA decayed forward to `now`.
+/// Read `slot` and return its EWMA decayed forward to `now`. A null
+/// pointer or a freshly-zeroed slot scores 0.
 #[allow(clippy::cast_precision_loss)]
-unsafe fn decay_score(
-    slots: *mut EwmaSlot,
-    slots_len: ngx_uint_t,
-    idx: ngx_uint_t,
-    now_msec: ngx_msec_t,
-) -> f64 {
-    if slots.is_null() || idx >= slots_len {
+unsafe fn decay_score(slot: *mut EwmaSlot, now_msec: ngx_msec_t) -> f64 {
+    if slot.is_null() {
         return 0.0;
     }
-    let slot = unsafe { *slots.add(idx) };
-    let td = now_msec.saturating_sub(slot.last_touched_msec);
+    let s = unsafe { *slot };
+    let td = now_msec.saturating_sub(s.last_touched_msec);
     let weight = (-(td as f64) / DECAY_MSEC).exp();
-    slot.ewma * weight
+    s.ewma * weight
 }
 
 /// Apply the standard EWMA recurrence `ewma = ewma*w + rtt*(1-w)` in
 /// place, with `w = exp(-td/DECAY)`. Bumps `last_touched_msec` to now.
 #[allow(clippy::cast_precision_loss)]
-unsafe fn ewma_update(
-    slots: *mut EwmaSlot,
-    slots_len: ngx_uint_t,
-    idx: ngx_uint_t,
-    rtt_msec: ngx_msec_t,
-    now_msec: ngx_msec_t,
-) {
-    if slots.is_null() || idx >= slots_len {
+unsafe fn ewma_update(slot: *mut EwmaSlot, rtt_msec: ngx_msec_t, now_msec: ngx_msec_t) {
+    if slot.is_null() {
         return;
     }
-    let slot_ptr = unsafe { slots.add(idx) };
-    let prev = unsafe { *slot_ptr };
+    let prev = unsafe { *slot };
     let td = now_msec.saturating_sub(prev.last_touched_msec);
     let weight = (-(td as f64) / DECAY_MSEC).exp();
     let new_ewma = prev.ewma * weight + (rtt_msec as f64) * (1.0 - weight);
     unsafe {
-        (*slot_ptr).ewma = new_ewma;
-        (*slot_ptr).last_touched_msec = now_msec;
+        (*slot).ewma = new_ewma;
+        (*slot).last_touched_msec = now_msec;
     }
+}
+
+/// Static variable table populated in [`register_variables`] from the
+/// module's `preconfiguration` hook. Mirrors the pattern used by
+/// `ngx-rust/examples/httporigdst.rs:103`: the array carries a static
+/// name and our get-handler; nginx's `ngx_http_add_variable` returns
+/// a fresh slot we then patch with that handler.
+static mut NGX_BALANCER_RS_EWMA_VARS: [ngx_http_variable_t; 1] = [ngx_http_variable_t {
+    name: ngx_string!("balancer_ewma_score"),
+    set_handler: None,
+    get_handler: Some(ngx_http_balancer_rs_ewma_score_variable),
+    data: 0,
+    flags: 0,
+    index: 0,
+}];
+
+/// Called from `Balancer::preconfiguration` (in `lib.rs`). Registers
+/// every `$balancer_*` variable owned by this module.
+pub(crate) unsafe fn register_variables(cf: *mut ngx_conf_t) -> ngx_int_t {
+    for mut v in unsafe { NGX_BALANCER_RS_EWMA_VARS } {
+        let added = unsafe { ngx_http_add_variable(cf, &raw mut v.name, v.flags) };
+        if added.is_null() {
+            return Status::NGX_ERROR.into();
+        }
+        unsafe {
+            (*added).get_handler = v.get_handler;
+            (*added).data = v.data;
+        }
+    }
+    Status::NGX_OK.into()
+}
+
+http_variable_get!(
+    ngx_http_balancer_rs_ewma_score_variable,
+    |request: &mut Request, v: *mut ngx_variable_value_t, _: usize| {
+        let our = unsafe { ewma_pick_data_for(request) };
+        let Some(our) = our else {
+            unsafe { (*v).set_not_found(1) };
+            return Status::NGX_OK;
+        };
+        if unsafe { (*our).pick_valid } == 0 {
+            // Single-peer fast path or no successful pick: no score.
+            unsafe { (*v).set_not_found(1) };
+            return Status::NGX_OK;
+        }
+
+        // 6 decimal places is enough resolution for an RTT-based EWMA
+        // and keeps log lines tidy. The pool buffer outlives the
+        // variable read (request pool, freed at request end).
+        let s = format!("{:.6}", unsafe { (*our).pick_score });
+        let bytes = s.as_bytes();
+        let pool = request.pool();
+        let buf = pool.alloc_unaligned(bytes.len());
+        if buf.is_null() {
+            return Status::NGX_ERROR;
+        }
+        // Bounded by f64 formatting (`{:.6}` produces ~30 chars at most),
+        // so the usize→u32 narrowing can't truncate in practice.
+        #[allow(clippy::cast_possible_truncation)]
+        let len_u32 = bytes.len() as u32;
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), bytes.len());
+            (*v).data = buf.cast::<u8>();
+            (*v).set_len(len_u32);
+            (*v).set_valid(1);
+            (*v).set_no_cacheable(0);
+            (*v).set_not_found(0);
+        }
+        Status::NGX_OK
+    }
+);
+
+/// Walk `r → upstream → peer.data` and return our wrapper if and only
+/// if this request's upstream is using the `ewma` policy. Identifies
+/// the policy via the upstream srv conf's `BalancerConfig.policy` —
+/// canonical, and avoids the unstable function-pointer comparison
+/// path that `peer.get == Some(get_peer)` would otherwise hit.
+unsafe fn ewma_pick_data_for(request: &Request) -> Option<*mut EwmaPeerData> {
+    let upstream = request.upstream()?;
+    if upstream.is_null() {
+        return None;
+    }
+    let uscf = unsafe { (*upstream).upstream };
+    if uscf.is_null() {
+        return None;
+    }
+    let ccf = Balancer::server_conf(unsafe { &*uscf })?;
+    if !matches!(ccf.policy, PolicyImpl::Ewma(_)) {
+        return None;
+    }
+    let data = unsafe { (*upstream).peer.data }.cast::<EwmaPeerData>();
+    if data.is_null() {
+        return None;
+    }
+    Some(data)
 }

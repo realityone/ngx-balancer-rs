@@ -145,6 +145,10 @@ impl HttpModule for Balancer {
         unsafe { &*::core::ptr::addr_of!(ngx_http_balancer_rs_module) }
     }
 
+    unsafe extern "C" fn preconfiguration(cf: *mut ngx_conf_t) -> ngx::ffi::ngx_int_t {
+        unsafe { ewma::register_variables(cf) }
+    }
+
     unsafe extern "C" fn create_srv_conf(cf: *mut ngx_conf_t) -> *mut c_void {
         let pool = unsafe { Pool::from_ngx_pool((*cf).pool) };
         let conf = pool.alloc_type::<BalancerConfig>();
