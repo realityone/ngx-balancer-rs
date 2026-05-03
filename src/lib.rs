@@ -7,8 +7,10 @@ use ngx::{
     core::Pool,
     ffi::{
         NGX_CONF_TAKE1, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF_OFFSET, NGX_HTTP_UPS_CONF,
-        NGX_LOG_EMERG, ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_module_t, ngx_str_t,
-        ngx_uint_t,
+        NGX_HTTP_UPSTREAM_BACKUP, NGX_HTTP_UPSTREAM_CREATE, NGX_HTTP_UPSTREAM_DOWN,
+        NGX_HTTP_UPSTREAM_FAIL_TIMEOUT, NGX_HTTP_UPSTREAM_MAX_CONNS, NGX_HTTP_UPSTREAM_MAX_FAILS,
+        NGX_HTTP_UPSTREAM_MODIFY, NGX_HTTP_UPSTREAM_WEIGHT, NGX_LOG_EMERG, NGX_LOG_WARN,
+        ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_module_t, ngx_str_t, ngx_uint_t,
     },
     http::{HttpModule, HttpModuleServerConf, Merge, MergeConfigError, NgxHttpUpstreamModule},
     ngx_conf_log_error, ngx_string,
@@ -102,10 +104,26 @@ unsafe extern "C" fn ngx_http_balancer_rs_commands_set(
     };
 
     let uscf = NgxHttpUpstreamModule::server_conf_mut(cf).expect("http upstream srv conf");
-    uscf.peer.init_upstream = match ccf.policy {
-        Policy::LeastConn => LeastConn::init_upstream(),
-        Policy::Unset => None,
-    };
+    if uscf.peer.init_upstream.is_some() {
+        ngx_conf_log_error!(NGX_LOG_WARN, cf, "load balancing method redefined");
+    }
+    match ccf.policy {
+        Policy::LeastConn => {
+            // Match stock nginx least_conn: accept the same `server`
+            // parameters (weight=, max_conns=, etc.) on lines that
+            // appear after this directive in the upstream block.
+            uscf.flags = (NGX_HTTP_UPSTREAM_CREATE
+                | NGX_HTTP_UPSTREAM_MODIFY
+                | NGX_HTTP_UPSTREAM_WEIGHT
+                | NGX_HTTP_UPSTREAM_MAX_CONNS
+                | NGX_HTTP_UPSTREAM_MAX_FAILS
+                | NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
+                | NGX_HTTP_UPSTREAM_DOWN
+                | NGX_HTTP_UPSTREAM_BACKUP) as ngx_uint_t;
+            uscf.peer.init_upstream = LeastConn::init_upstream();
+        }
+        Policy::Unset => {}
+    }
 
     ngx::core::NGX_CONF_OK
 }
