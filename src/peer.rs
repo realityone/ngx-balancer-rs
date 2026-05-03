@@ -6,10 +6,13 @@
 //! eligibility filtering, the bookkeeping done after a peer is chosen,
 //! and the rwlock that gates a peers list living in a shared zone.
 
-use ngx::core::Status;
-use ngx::ffi::{
-    ngx_http_upstream_rr_peer_data_t, ngx_http_upstream_rr_peer_t, ngx_http_upstream_rr_peers_t,
-    ngx_int_t, ngx_peer_connection_t, ngx_rwlock_unlock, ngx_rwlock_wlock, ngx_uint_t, time_t,
+use ngx::{
+    core::Status,
+    ffi::{
+        ngx_http_upstream_rr_peer_data_t, ngx_http_upstream_rr_peer_t,
+        ngx_http_upstream_rr_peers_t, ngx_int_t, ngx_peer_connection_t, ngx_rwlock_unlock,
+        ngx_rwlock_wlock, ngx_uint_t, time_t,
+    },
 };
 
 pub(crate) const PTR_BITS: ngx_uint_t = ngx_uint_t::BITS as ngx_uint_t;
@@ -100,4 +103,3 @@ pub(crate) fn busy_with_primary_name(
     }
     Status::NGX_BUSY.into()
 }
-

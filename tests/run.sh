@@ -10,16 +10,29 @@ cd "$(dirname "$0")/.."
 
 cargo build
 
-NGINX_BIN=$(find "$PWD/target/debug/build" -path '*/nginx-sys-*/out/objs/nginx' -type f -printf '%T@ %p\n' \
-    | sort -nr | head -1 | cut -d' ' -f2-)
+NGINX_BIN=
+NGINX_MTIME=0
+while IFS= read -r -d '' candidate; do
+    mtime=$(stat -f '%m' "$candidate" 2>/dev/null || stat -c '%Y' "$candidate")
+    if (( mtime > NGINX_MTIME )); then
+        NGINX_BIN=$candidate
+        NGINX_MTIME=$mtime
+    fi
+done < <(find "$PWD/target/debug/build" -path '*/nginx-sys-*/out/objs/nginx' -type f -print0)
 if [[ -z "${NGINX_BIN:-}" ]]; then
     echo "tests: vendored nginx binary not found under target/debug/build/nginx-sys-*/out/objs/" >&2
     exit 1
 fi
 
-MODULE_SO="$PWD/target/debug/libngx_balancer_rs.so"
-if [[ ! -f "$MODULE_SO" ]]; then
-    echo "tests: module not found at $MODULE_SO" >&2
+MODULE_SO=
+for candidate in "$PWD"/target/debug/libngx_balancer_rs.{so,dylib}; do
+    if [[ -f "$candidate" ]]; then
+        MODULE_SO=$candidate
+        break
+    fi
+done
+if [[ -z "${MODULE_SO:-}" ]]; then
+    echo "tests: module not found under target/debug/libngx_balancer_rs.{so,dylib}" >&2
     exit 1
 fi
 
