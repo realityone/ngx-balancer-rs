@@ -28,3 +28,4 @@ target
 # Vendored nginx test harness (cloned by tests/run.sh)
 /tests/nginx-tests/
 /nginx
+/ingress-nginx

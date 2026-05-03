@@ -16,23 +16,30 @@ use ngx::{
     ngx_conf_log_error, ngx_string,
 };
 
+mod ewma;
 mod least_conn;
+mod peer;
 mod policy;
 
-use crate::{least_conn::LeastConn, policy::BalancingPolicy};
+use crate::{ewma::Ewma, least_conn::LeastConn, policy::BalancingPolicy};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Tagged union of `BalancingPolicy` impls. Each variant carries the
+/// per-upstream state that policy needs (`Ewma` owns its slot-table
+/// pointer; `LeastConn` is stateless because all its bookkeeping
+/// lives on the existing `rr_peer*` structs).
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
-enum Policy {
+enum PolicyImpl {
     #[default]
     Unset,
-    LeastConn,
+    LeastConn(LeastConn),
+    Ewma(Ewma),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 struct BalancerConfig {
-    policy: Policy,
+    policy: PolicyImpl,
 }
 
 impl Merge for BalancerConfig {
@@ -90,39 +97,46 @@ unsafe extern "C" fn ngx_http_balancer_rs_commands_set(
     };
 
     let bytes = unsafe { core::slice::from_raw_parts(value.data, value.len) };
-    ccf.policy = if bytes == b"least_conn" {
-        Policy::LeastConn
-    } else {
-        ngx_conf_log_error!(
-            NGX_LOG_EMERG,
-            cf,
-            "balancer_rs: unknown policy \"{}\" in \"{}\" directive",
-            value,
-            unsafe { &(*cmd).name }
-        );
-        return ngx::core::NGX_CONF_ERROR;
+    ccf.policy = match bytes {
+        b"least_conn" => PolicyImpl::LeastConn(LeastConn),
+        b"ewma" => PolicyImpl::Ewma(Ewma::new()),
+        _ => {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                cf,
+                "balancer_rs: unknown policy \"{}\" in \"{}\" directive",
+                value,
+                unsafe { &(*cmd).name }
+            );
+            return ngx::core::NGX_CONF_ERROR;
+        }
     };
 
     let uscf = NgxHttpUpstreamModule::server_conf_mut(cf).expect("http upstream srv conf");
     if uscf.peer.init_upstream.is_some() {
         ngx_conf_log_error!(NGX_LOG_WARN, cf, "load balancing method redefined");
     }
+    // Both policies accept the full set of stock-nginx server params.
+    // We pick a single mask up front because the parser uses these
+    // flags when reading subsequent `server` lines.
+    let policy_flags = (NGX_HTTP_UPSTREAM_CREATE
+        | NGX_HTTP_UPSTREAM_MODIFY
+        | NGX_HTTP_UPSTREAM_WEIGHT
+        | NGX_HTTP_UPSTREAM_MAX_CONNS
+        | NGX_HTTP_UPSTREAM_MAX_FAILS
+        | NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
+        | NGX_HTTP_UPSTREAM_DOWN
+        | NGX_HTTP_UPSTREAM_BACKUP) as ngx_uint_t;
     match ccf.policy {
-        Policy::LeastConn => {
-            // Match stock nginx least_conn: accept the same `server`
-            // parameters (weight=, max_conns=, etc.) on lines that
-            // appear after this directive in the upstream block.
-            uscf.flags = (NGX_HTTP_UPSTREAM_CREATE
-                | NGX_HTTP_UPSTREAM_MODIFY
-                | NGX_HTTP_UPSTREAM_WEIGHT
-                | NGX_HTTP_UPSTREAM_MAX_CONNS
-                | NGX_HTTP_UPSTREAM_MAX_FAILS
-                | NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
-                | NGX_HTTP_UPSTREAM_DOWN
-                | NGX_HTTP_UPSTREAM_BACKUP) as ngx_uint_t;
+        PolicyImpl::LeastConn(_) => {
+            uscf.flags = policy_flags;
             uscf.peer.init_upstream = LeastConn::init_upstream();
         }
-        Policy::Unset => {}
+        PolicyImpl::Ewma(_) => {
+            uscf.flags = policy_flags;
+            uscf.peer.init_upstream = Ewma::init_upstream();
+        }
+        PolicyImpl::Unset => {}
     }
 
     ngx::core::NGX_CONF_OK
@@ -147,7 +161,7 @@ impl HttpModule for Balancer {
             return ptr::null_mut();
         }
 
-        unsafe { (*conf).policy = Policy::Unset };
+        unsafe { (*conf).policy = PolicyImpl::Unset };
 
         conf.cast::<c_void>()
     }

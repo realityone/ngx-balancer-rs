@@ -10,30 +10,33 @@
 //! Ties are broken by a weighted round-robin pass over the equal-ratio
 //! peers, identical to the stock module.
 
-use core::cmp::Ordering;
-use core::ffi::c_void;
-use core::ptr;
+use core::{cmp::Ordering, ffi::c_void, ptr};
 
-use ngx::core::Status;
-use ngx::ffi::{
-    ngx_cached_time, ngx_conf_t, ngx_http_upstream_get_round_robin_peer,
-    ngx_http_upstream_init_pt, ngx_http_upstream_init_round_robin,
-    ngx_http_upstream_init_round_robin_peer, ngx_http_upstream_rr_peer_data_t,
-    ngx_http_upstream_rr_peer_t, ngx_http_upstream_rr_peers_t, ngx_http_upstream_srv_conf_t,
-    ngx_int_t, ngx_peer_connection_t, ngx_rwlock_unlock, ngx_rwlock_wlock, ngx_uint_t, time_t,
+use ngx::{
+    core::Status,
+    ffi::{
+        ngx_cached_time, ngx_conf_t, ngx_http_upstream_get_round_robin_peer,
+        ngx_http_upstream_init_pt, ngx_http_upstream_init_round_robin,
+        ngx_http_upstream_init_round_robin_peer, ngx_http_upstream_rr_peer_data_t,
+        ngx_http_upstream_rr_peer_t, ngx_http_upstream_rr_peers_t, ngx_http_upstream_srv_conf_t,
+        ngx_int_t, ngx_peer_connection_t, ngx_uint_t, time_t,
+    },
+    http::Request,
+    http_upstream_init_peer_pt, ngx_log_debug_http, ngx_log_debug_mask,
 };
-use ngx::http::Request;
-use ngx::{http_upstream_init_peer_pt, ngx_log_debug_http, ngx_log_debug_mask};
 
-use crate::{Policy, policy::BalancingPolicy};
+use crate::{
+    peer::{
+        PTR_BITS, busy_with_primary_name, peer_available, peers_wlock, peers_wunlock, select_peer,
+    },
+    policy::BalancingPolicy,
+};
 
-const PTR_BITS: ngx_uint_t = ngx_uint_t::BITS as ngx_uint_t;
-
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
 pub struct LeastConn;
 
 impl BalancingPolicy for LeastConn {
-    const KIND: Policy = Policy::LeastConn;
-
     fn init_upstream() -> ngx_http_upstream_init_pt {
         Some(init_upstream)
     }
@@ -184,20 +187,6 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
     }
 }
 
-/// Set `pc.name` from the primary peers list (or leave it alone if the
-/// pointer is null) and return `NGX_BUSY`. Centralizes the parity with
-/// the stock module's `busy:` label, where the outer-call's primary
-/// peers always win the final name assignment.
-fn busy_with_primary_name(
-    pc: *mut ngx_peer_connection_t,
-    primary_peers: *mut ngx_http_upstream_rr_peers_t,
-) -> ngx_int_t {
-    if !primary_peers.is_null() {
-        unsafe { (*pc).name = (*primary_peers).name };
-    }
-    Status::NGX_BUSY.into()
-}
-
 enum Selection {
     Selected,
     TryBackup,
@@ -287,81 +276,9 @@ unsafe fn ratio_cmp(
     peer: *const ngx_http_upstream_rr_peer_t,
     other: *const ngx_http_upstream_rr_peer_t,
 ) -> Ordering {
-    let lhs = i128::from(unsafe { (*peer).conns } as u64)
-        * i128::from(unsafe { (*other).weight } as i64);
-    let rhs = i128::from(unsafe { (*other).conns } as u64)
-        * i128::from(unsafe { (*peer).weight } as i64);
+    let lhs =
+        i128::from(unsafe { (*peer).conns } as u64) * i128::from(unsafe { (*other).weight } as i64);
+    let rhs =
+        i128::from(unsafe { (*other).conns } as u64) * i128::from(unsafe { (*peer).weight } as i64);
     lhs.cmp(&rhs)
-}
-
-/// Eligibility check matching the stock module: skip already-tried,
-/// administratively-down, fail-quarantined, or `max_conns`-saturated peers.
-unsafe fn peer_available(
-    rrp: *mut ngx_http_upstream_rr_peer_data_t,
-    peer: *mut ngx_http_upstream_rr_peer_t,
-    index: ngx_uint_t,
-    now: time_t,
-) -> bool {
-    let n = index / PTR_BITS;
-    let m = 1 << (index % PTR_BITS);
-    if unsafe { *(*rrp).tried.add(n) } & m != 0 {
-        return false;
-    }
-    if unsafe { (*peer).down } != 0 {
-        return false;
-    }
-    if unsafe {
-        (*peer).max_fails != 0
-            && (*peer).fails >= (*peer).max_fails
-            && now - (*peer).checked <= (*peer).fail_timeout
-    } {
-        return false;
-    }
-    if unsafe { (*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns } {
-        return false;
-    }
-    true
-}
-
-/// Commit the selected peer: stamp `pc`, bump conns, mark tried.
-unsafe fn select_peer(
-    pc: *mut ngx_peer_connection_t,
-    rrp: *mut ngx_http_upstream_rr_peer_data_t,
-    peer: *mut ngx_http_upstream_rr_peer_t,
-    index: ngx_uint_t,
-    now: time_t,
-) {
-    unsafe {
-        (*pc).sockaddr = (*peer).sockaddr;
-        (*pc).socklen = (*peer).socklen;
-        (*pc).name = &raw mut (*peer).name;
-
-        if now - (*peer).checked > (*peer).fail_timeout {
-            (*peer).checked = now;
-        }
-
-        (*peer).conns += 1;
-        (*rrp).current = peer;
-        // Mirrors stock nginx's `ngx_http_upstream_rr_peer_ref` macro:
-        // a no-op outside zone builds, but our vendored nginx is built
-        // with NGX_HTTP_UPSTREAM_ZONE so the bump keeps the peer alive
-        // across reconfigures while the request still references it.
-        (*peer).refs += 1;
-
-        let n = index / PTR_BITS;
-        let m = 1 << (index % PTR_BITS);
-        *(*rrp).tried.add(n) |= m;
-    }
-}
-
-unsafe fn peers_wlock(peers: *mut ngx_http_upstream_rr_peers_t) {
-    if !unsafe { (*peers).shpool.is_null() } {
-        unsafe { ngx_rwlock_wlock(&raw mut (*peers).rwlock) };
-    }
-}
-
-unsafe fn peers_wunlock(peers: *mut ngx_http_upstream_rr_peers_t) {
-    if !unsafe { (*peers).shpool.is_null() } {
-        unsafe { ngx_rwlock_unlock(&raw mut (*peers).rwlock) };
-    }
 }
