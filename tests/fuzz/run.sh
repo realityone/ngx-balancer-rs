@@ -31,6 +31,18 @@ ulimit -Sn "$TEST_NGINX_NOFILE"
 
 cargo build
 
+# `chaos_backend.py` and `fuzz_client.py` declare aiohttp via PEP 723
+# inline metadata; `uv run --script` provisions a transient env on
+# first run. Pull uv from $PATH or its standard install location.
+if ! command -v uv >/dev/null 2>&1; then
+    if [[ -x "$HOME/.local/bin/uv" ]]; then
+        PATH="$HOME/.local/bin:$PATH"
+    else
+        echo "fuzz: uv not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
+        exit 1
+    fi
+fi
+
 # stat -c (GNU) vs stat -f (BSD) — same probe as tests/run.sh.
 if stat -c '%Y' /dev/null >/dev/null 2>&1; then
     stat_mtime() { stat -c '%Y' "$1"; }
@@ -88,7 +100,7 @@ trap cleanup EXIT
 
 echo "fuzz: spawning chaos backends (seed=$FUZZ_SEED)"
 for port in 9081 9082 9083 9084 9085; do
-    perl "$PWD/tests/fuzz/chaos_backend.pl" --port="$port" --seed="$FUZZ_SEED" \
+    uv run --script "$PWD/tests/fuzz/chaos_backend.py" --port="$port" --seed="$FUZZ_SEED" \
         >>"$LOGS/backend.log" 2>&1 &
     BACKEND_PIDS+=("$!")
 done
@@ -126,7 +138,7 @@ if ! (echo > /dev/tcp/127.0.0.1/9080) 2>/dev/null; then
 fi
 
 echo "fuzz: driving load for ${FUZZ_DURATION}s with $FUZZ_CLIENTS clients"
-python3 "$PWD/tests/fuzz/fuzz_client.py" \
+uv run --script "$PWD/tests/fuzz/fuzz_client.py" \
     --target 127.0.0.1:9080 \
     --duration "$FUZZ_DURATION" \
     --clients "$FUZZ_CLIENTS" \

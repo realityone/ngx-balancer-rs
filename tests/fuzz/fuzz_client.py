@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["aiohttp>=3.9"]
+# ///
 """Concurrent randomized HTTP client for the balancer_rs fuzz harness.
 
 Drives `FUZZ_CLIENTS` asyncio tasks against a target nginx for
@@ -6,9 +10,6 @@ Drives `FUZZ_CLIENTS` asyncio tasks against a target nginx for
 (under `/lc/` or `/ewma/`), body size, and Connection header per
 request. All exceptions are caught and bucketed — no failure mode
 should kill a worker.
-
-Stdlib only: `asyncio`, `argparse`, `random`, plus `socket` /
-plain BSD streams (no `aiohttp`, which isn't installed).
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
+
+import aiohttp
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-POLICIES = ("lc", "ewma")
+POLICIES = ("lc", "ewma", "rr")
 
 
 @dataclass
@@ -65,34 +68,11 @@ def random_method(rng: random.Random) -> str:
 
 
 def random_body(rng: random.Random) -> bytes:
-    # 0-4 KiB of opaque bytes.
     n = rng.randint(0, 4096)
     return bytes(rng.getrandbits(8) for _ in range(n))
 
 
-def build_request(host: str, port: int, path: str, rng: random.Random) -> bytes:
-    method = random_method(rng)
-    keepalive = rng.random() < 0.30
-    body = random_body(rng) if method == "POST" else b""
-
-    lines = [
-        f"{method} {path} HTTP/1.1".encode(),
-        f"Host: {host}:{port}".encode(),
-        f"Connection: {'keep-alive' if keepalive else 'close'}".encode(),
-        b"User-Agent: balancer_rs-fuzz/1",
-    ]
-    if method == "POST":
-        lines.append(f"Content-Length: {len(body)}".encode())
-        lines.append(b"Content-Type: application/octet-stream")
-    return b"\r\n".join(lines) + b"\r\n\r\n" + body
-
-
-def classify_status(line: bytes) -> str:
-    # b"HTTP/1.1 200 OK\r\n"
-    parts = line.split(b" ", 2)
-    if len(parts) < 2 or not parts[1].isdigit():
-        return "protocol_error"
-    code = int(parts[1])
+def classify_status(code: int) -> str:
     if 200 <= code < 300:
         return "2xx"
     if 300 <= code < 400:
@@ -104,53 +84,45 @@ def classify_status(line: bytes) -> str:
     return "protocol_error"
 
 
-async def one_request(host: str, port: int, path: str, rng: random.Random,
-                      timeout: float) -> str:
+async def one_request(session: aiohttp.ClientSession, base: str,
+                      rng: random.Random, timeout: float) -> tuple[str, str]:
+    policy, path = random_policy_path(rng)
+    method = random_method(rng)
+    keepalive = rng.random() < 0.30
+    headers = {
+        "User-Agent": "balancer_rs-fuzz/1",
+        "Connection": "keep-alive" if keepalive else "close",
+    }
+    data = random_body(rng) if method == "POST" else None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout)
-    except (asyncio.TimeoutError, ConnectionError, OSError):
-        return "connect_error"
-
-    try:
-        writer.write(build_request(host, port, path, rng))
-        await asyncio.wait_for(writer.drain(), timeout=timeout)
-        try:
-            status_line = await asyncio.wait_for(
-                reader.readline(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return "timeout"
-        if not status_line:
-            return "protocol_error"
-
-        outcome = classify_status(status_line)
-
-        # Drain the body — some bugs only show up when nginx finishes
-        # streaming. Cap the drain at `timeout` total.
-        try:
-            await asyncio.wait_for(reader.read(-1), timeout=timeout)
-        except asyncio.TimeoutError:
-            return "timeout"
-        return outcome
-    except (ConnectionError, OSError):
-        return "protocol_error"
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except (ConnectionError, OSError):
-            pass
+        async with session.request(
+            method,
+            base + path,
+            data=data,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            outcome = classify_status(resp.status)
+            # Drain — some bugs only show up after nginx finishes streaming.
+            await resp.read()
+            return policy, outcome
+    except asyncio.TimeoutError:
+        return policy, "timeout"
+    except aiohttp.ClientConnectorError:
+        return policy, "connect_error"
+    except aiohttp.ClientError:
+        return policy, "protocol_error"
 
 
-async def worker(idx: int, host: str, port: int, base_seed: int,
-                 stats: Stats, timeout: float) -> None:
+async def worker(idx: int, base: str, base_seed: int,
+                 stats: Stats, timeout: float,
+                 session: aiohttp.ClientSession) -> None:
     rng = random.Random(base_seed ^ (idx * 0x9E37_79B9))
     while time.monotonic() < stats.deadline:
-        policy, path = random_policy_path(rng)
         try:
-            outcome = await one_request(host, port, path, rng, timeout)
+            policy, outcome = await one_request(session, base, rng, timeout)
         except Exception as e:  # noqa: BLE001 — swallow everything
-            stats.counters[policy][f"unexpected:{type(e).__name__}"] += 1
+            stats.counters[POLICIES[0]][f"unexpected:{type(e).__name__}"] += 1
             continue
         stats.counters[policy][outcome] += 1
 
@@ -159,11 +131,7 @@ async def main_async(args: argparse.Namespace) -> int:
     target = args.target
     if target.startswith("http://"):
         target = target[len("http://"):]
-    if ":" in target:
-        host, port_str = target.rsplit(":", 1)
-        port = int(port_str)
-    else:
-        host, port = target, 80
+    base = f"http://{target}"
 
     base_seed = args.seed if args.seed else int(time.time() * 1000) & 0xFFFFFFFF
     stats = Stats(
@@ -171,14 +139,16 @@ async def main_async(args: argparse.Namespace) -> int:
         deadline=time.monotonic() + args.duration,
     )
 
-    print(f"fuzz_client: host={host} port={port} clients={args.clients} "
+    print(f"fuzz_client: target={target} clients={args.clients} "
           f"duration={args.duration}s seed={base_seed}", flush=True)
 
-    workers = [
-        asyncio.create_task(worker(i, host, port, base_seed, stats, args.timeout))
-        for i in range(args.clients)
-    ]
-    await asyncio.gather(*workers, return_exceptions=True)
+    async with aiohttp.ClientSession() as session:
+        workers = [
+            asyncio.create_task(
+                worker(i, base, base_seed, stats, args.timeout, session))
+            for i in range(args.clients)
+        ]
+        await asyncio.gather(*workers, return_exceptions=True)
 
     grand_total = sum(sum(c.values()) for c in stats.counters.values())
     print("fuzz_client: summary")

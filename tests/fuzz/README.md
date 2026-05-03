@@ -33,6 +33,20 @@ FUZZ_KEEP=1 tests/fuzz/run.sh                      # don't rm the prefix on succ
 The harness writes everything to `target/fuzz-prefix/` (nginx
 prefix, pid file, error/access logs, backend stderr).
 
+## Prerequisites
+
+[`uv`](https://docs.astral.sh/uv/) is required — `chaos_backend.py`
+and `fuzz_client.py` declare aiohttp via PEP 723 inline metadata
+and `run.sh` invokes them with `uv run --script`, which provisions
+a transient env on first run. Install with:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+`run.sh` looks for `uv` on `$PATH` and falls back to
+`~/.local/bin/uv` (where the installer puts it).
+
 ## Pieces
 
 - **`run.sh`** — entry point. Builds the module, locates the
@@ -40,20 +54,25 @@ prefix, pid file, error/access logs, backend stderr).
   nginx, drives the fuzz client, then checks the error log and
   reports pass/fail. Reuses the build/discovery logic from
   `tests/run.sh`.
-- **`nginx.conf`** — two upstreams (`u_lc` with `balancer_rs
-  least_conn`, `u_ewma` with `balancer_rs ewma`), 4 primaries +
-  1 backup each, path-routed via `/lc/` and `/ewma/`. Aggressive
-  `proxy_*_timeout` so chaos hangs surface quickly. `proxy_next_upstream`
-  set so failures exercise the retry path.
-- **`chaos_backend.pl`** — randomized HTTP listener seeded per port.
-  Each accepted request rolls a die: 60% instant 200, 15% slow 200
-  (50–500 ms), 10% 502, 8% partial-header close, 5% partial-body
-  close, 2% sleep 30 s (forces nginx upstream timeout).
-- **`fuzz_client.py`** — asyncio + stdlib (no `aiohttp`). Spawns
-  `FUZZ_CLIENTS` workers; each loops, picking random method
-  (GET/POST/HEAD), random path under `/lc/` or `/ewma/`, random
-  body, random Connection header, with a per-request timeout.
-  Catches every exception; prints a counter summary at exit.
+- **`nginx.conf`** — three upstreams sharing the same peer set
+  (4 primaries + 1 backup): `u_lc` with `balancer_rs least_conn`,
+  `u_ewma` with `balancer_rs ewma`, and `u_rr` with no
+  `balancer_rs` directive (stock nginx round-robin, the control
+  column in the summary). Path-routed via `/lc/`, `/ewma/`, and
+  `/rr/`. Aggressive `proxy_*_timeout` so chaos hangs surface
+  quickly. `proxy_next_upstream` set so failures exercise the
+  retry path.
+- **`chaos_backend.py`** — aiohttp randomized HTTP listener seeded
+  per port. Each request rolls a die: 73% instant 200, 15% slow 200
+  (50–500 ms), 10% 502, 2% sleep 30 s (forces nginx upstream
+  timeout). Earlier malformed-framing branches (partial header /
+  partial body) were dropped when this moved off raw asyncio —
+  aiohttp's response writer always sends well-formed HTTP.
+- **`fuzz_client.py`** — aiohttp client. Spawns `FUZZ_CLIENTS`
+  workers; each loops, picking random method (GET/POST/HEAD),
+  random path under `/lc/` or `/ewma/`, random body, random
+  Connection header, with a per-request timeout. Catches every
+  exception; prints a counter summary at exit.
 
 ## Pass criteria
 
