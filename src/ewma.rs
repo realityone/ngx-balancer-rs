@@ -24,8 +24,10 @@ use ngx::{
         ngx_http_upstream_init_pt, ngx_http_upstream_init_round_robin,
         ngx_http_upstream_init_round_robin_peer, ngx_http_upstream_rr_peer_data_t,
         ngx_http_upstream_rr_peer_t, ngx_http_upstream_rr_peers_t, ngx_http_upstream_srv_conf_t,
-        ngx_http_variable_t, ngx_int_t, ngx_msec_t, ngx_peer_connection_t, ngx_random,
-        ngx_uint_t, ngx_variable_value_t, sockaddr, socklen_t, time_t,
+        ngx_http_variable_t, ngx_int_t, ngx_module_t, ngx_msec_t, ngx_peer_connection_t,
+        ngx_random, ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_calloc,
+        ngx_slab_calloc_locked, ngx_slab_free, ngx_slab_pool_t, ngx_str_t, ngx_uint_t,
+        ngx_variable_value_t, sockaddr, socklen_t, time_t,
     },
     http::{HttpModuleServerConf, Request},
     http_upstream_init_peer_pt, http_variable_get, ngx_log_debug_http, ngx_log_debug_mask,
@@ -94,6 +96,10 @@ struct EwmaConfig {
     primary_len: ngx_uint_t,
     backup_slots: *mut EwmaSlot,
     backup_len: ngx_uint_t,
+    /// Slab pool used for runtime slot-table reallocation during
+    /// dynamic resync. Null in non-zone mode (where peer churn
+    /// can't happen — `peers->config` is null and never increments).
+    shpool: *mut ngx_slab_pool_t,
 }
 
 /// One eligible peer captured during `collect_available`. Carries
@@ -126,6 +132,13 @@ struct EwmaPeerData {
     pick_score: f64,
 }
 
+/// Hard-coded size of the per-upstream shm zone we register in
+/// zone mode. Holds `EwmaConfig` + slot tables + slab allocator
+/// metadata + headroom for resync churn. ~64 KB is enough for
+/// fleets up to a few hundred peers; configurable would be cleaner
+/// but is deferred.
+const EWMA_ZONE_SIZE: usize = 64 * 1024;
+
 unsafe extern "C" fn init_upstream(
     cf: *mut ngx_conf_t,
     us: *mut ngx_http_upstream_srv_conf_t,
@@ -140,11 +153,27 @@ unsafe extern "C" fn init_upstream(
         return Status::NGX_ERROR.into();
     }
 
+    unsafe { (*us).peer.init = Some(init_peer) };
+
+    if unsafe { (*us).shm_zone }.is_null() {
+        return unsafe { init_upstream_static(cf, us) };
+    }
+
+    // round_robin's zone init runs *after* us and replaces
+    // `us->peer.data` with shpool peers. Defer EwmaConfig allocation
+    // to our own shm zone's init callback, which nginx fires after
+    // round_robin's.
+    unsafe { register_ewma_zone(cf, us) }
+}
+
+unsafe fn init_upstream_static(
+    cf: *mut ngx_conf_t,
+    us: *mut ngx_http_upstream_srv_conf_t,
+) -> ngx_int_t {
     let primary = unsafe { (*us).peer.data }.cast::<ngx_http_upstream_rr_peers_t>();
     if primary.is_null() {
         return Status::NGX_ERROR.into();
     }
-
     let pool = unsafe { Pool::from_ngx_pool((*cf).pool) };
 
     let primary_len = unsafe { (*primary).number };
@@ -175,18 +204,156 @@ unsafe extern "C" fn init_upstream(
         (*cfg).primary_len = primary_len;
         (*cfg).backup_slots = backup_slots;
         (*cfg).backup_len = backup_len;
+        (*cfg).shpool = ptr::null_mut();
     }
 
     let ccf = Balancer::server_conf_mut(unsafe { &*us }).expect("balancer_rs srv conf");
     match &mut ccf.policy {
         PolicyImpl::Ewma(state) => state.config = cfg,
-        // Unreachable in practice — `commands_set` already installed
-        // `PolicyImpl::Ewma(...)` before nginx invoked us.
         _ => return Status::NGX_ERROR.into(),
     }
-
-    unsafe { (*us).peer.init = Some(init_peer) };
     Status::NGX_OK.into()
+}
+
+/// Prefix for the per-upstream `ngx_shm_zone_t` name. Concatenated
+/// with `(*us).host` so multiple `balancer_rs ewma` upstreams in
+/// the same process get distinct zones.
+const ZONE_NAME_PREFIX: &[u8] = b"balancer_rs_ewma_";
+
+/// Register a per-upstream `ngx_shm_zone_t` and set its init
+/// callback. The callback runs in master after `round_robin`'s zone
+/// init has populated shpool peers; allocations done there land in
+/// shared memory and survive into every forked worker.
+unsafe fn register_ewma_zone(
+    cf: *mut ngx_conf_t,
+    us: *mut ngx_http_upstream_srv_conf_t,
+) -> ngx_int_t {
+    let pool = unsafe { Pool::from_ngx_pool((*cf).pool) };
+
+    let host_len = unsafe { (*us).host.len };
+    let host_data = unsafe { (*us).host.data };
+    let total = ZONE_NAME_PREFIX.len() + host_len;
+    let buf = pool.alloc_unaligned(total).cast::<u8>();
+    if buf.is_null() {
+        return Status::NGX_ERROR.into();
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(ZONE_NAME_PREFIX.as_ptr(), buf, ZONE_NAME_PREFIX.len());
+        if host_len > 0 {
+            ptr::copy_nonoverlapping(host_data, buf.add(ZONE_NAME_PREFIX.len()), host_len);
+        }
+    }
+    let name_ptr = pool.alloc_type::<ngx_str_t>();
+    if name_ptr.is_null() {
+        return Status::NGX_ERROR.into();
+    }
+    unsafe {
+        (*name_ptr).len = total;
+        (*name_ptr).data = buf;
+    }
+
+    let module_ptr: *const ngx_module_t = &raw const crate::ngx_http_balancer_rs_module;
+    let shm_zone = unsafe {
+        ngx_shared_memory_add(cf, name_ptr, EWMA_ZONE_SIZE, module_ptr.cast_mut().cast())
+    };
+    if shm_zone.is_null() {
+        return Status::NGX_ERROR.into();
+    }
+    unsafe {
+        (*shm_zone).init = Some(ewma_zone_init);
+        (*shm_zone).data = us.cast::<c_void>();
+    }
+    Status::NGX_OK.into()
+}
+
+/// Init callback for our `ngx_shm_zone_t`. Runs in master, after
+/// the `round_robin` zone module's init has copied peers into the
+/// upstream's own shpool — so `(*us).peer.data` now points at the
+/// shpool peers list and we can walk it to size + stamp our slots.
+unsafe extern "C" fn ewma_zone_init(
+    zone: *mut ngx_shm_zone_t,
+    _data: *mut c_void,
+) -> ngx_int_t {
+    let us = unsafe { (*zone).data }.cast::<ngx_http_upstream_srv_conf_t>();
+    if us.is_null() {
+        return Status::NGX_ERROR.into();
+    }
+    // `shm.addr` is `*mut u_char` (align 1), but every shared zone
+    // begins with a page-aligned `ngx_slab_pool_t` header — alignment
+    // is guaranteed by nginx, so silence the strict-alignment lint.
+    #[allow(clippy::cast_ptr_alignment)]
+    let shpool = unsafe { (*zone).shm.addr }.cast::<ngx_slab_pool_t>();
+    if shpool.is_null() {
+        return Status::NGX_ERROR.into();
+    }
+
+    let primary = unsafe { (*us).peer.data }.cast::<ngx_http_upstream_rr_peers_t>();
+    if primary.is_null() {
+        return Status::NGX_ERROR.into();
+    }
+
+    // The slab pool is uncontended at zone-init time — master is the
+    // only process touching it before workers fork — so the unlocked
+    // `_locked` variants are safe (they skip taking shpool->mutex).
+    let primary_len = unsafe { (*primary).number };
+    let primary_slots = unsafe { alloc_slots_shpool(shpool, primary_len) };
+    if primary_slots.is_null() && primary_len > 0 {
+        return Status::NGX_ERROR.into();
+    }
+    unsafe { stamp_slot_identities(primary, primary_slots, primary_len) };
+
+    let backup = unsafe { (*primary).next };
+    let (backup_len, backup_slots) = if backup.is_null() {
+        (0, ptr::null_mut())
+    } else {
+        let n = unsafe { (*backup).number };
+        let p = unsafe { alloc_slots_shpool(shpool, n) };
+        if p.is_null() && n > 0 {
+            return Status::NGX_ERROR.into();
+        }
+        unsafe { stamp_slot_identities(backup, p, n) };
+        (n, p)
+    };
+
+    let cfg = unsafe {
+        ngx_slab_calloc_locked(shpool, core::mem::size_of::<EwmaConfig>()).cast::<EwmaConfig>()
+    };
+    if cfg.is_null() {
+        return Status::NGX_ERROR.into();
+    }
+    unsafe {
+        (*cfg).primary_peers = primary;
+        (*cfg).primary_slots = primary_slots;
+        (*cfg).primary_len = primary_len;
+        (*cfg).backup_slots = backup_slots;
+        (*cfg).backup_len = backup_len;
+        (*cfg).shpool = shpool;
+    }
+
+    // Stamp the EwmaConfig pointer onto the BalancerConfig before
+    // fork. All workers will inherit the same value via fork CoW;
+    // since the EwmaConfig itself lives in shared memory, every
+    // worker dereferences to the same physical pages.
+    let ccf = Balancer::server_conf_mut(unsafe { &*us }).expect("balancer_rs srv conf");
+    match &mut ccf.policy {
+        PolicyImpl::Ewma(state) => state.config = cfg,
+        _ => return Status::NGX_ERROR.into(),
+    }
+    Status::NGX_OK.into()
+}
+
+/// Slab-allocate a zero-initialized `EwmaSlot` array. Caller is
+/// responsible for ensuring the slab pool is either uncontended
+/// (zone init) or that `shpool->mutex` is held (runtime resync).
+unsafe fn alloc_slots_shpool(
+    shpool: *mut ngx_slab_pool_t,
+    len: ngx_uint_t,
+) -> *mut EwmaSlot {
+    if len == 0 {
+        return ptr::null_mut();
+    }
+    let bytes = len.saturating_mul(core::mem::size_of::<EwmaSlot>());
+    unsafe { ngx_slab_calloc_locked(shpool, bytes) }.cast::<EwmaSlot>()
 }
 
 /// Allocate a zero-initialized `EwmaSlot` array from `pool`. Returns
@@ -239,17 +406,15 @@ unsafe fn find_slot_by_sockaddr(
     if slots.is_null() || sockaddr.is_null() || socklen == 0 {
         return ptr::null_mut();
     }
-    for i in 0..len {
-        let slot = unsafe { slots.add(i) };
-        let s_addr = unsafe { (*slot).sockaddr };
-        let s_len = unsafe { (*slot).socklen };
-        if s_addr.is_null() || s_len != socklen {
+    let table = unsafe { core::slice::from_raw_parts_mut(slots, len) };
+    let n = socklen as usize;
+    let needle = unsafe { core::slice::from_raw_parts(sockaddr.cast::<u8>(), n) };
+    for slot in table {
+        if slot.sockaddr.is_null() || slot.socklen != socklen {
             continue;
         }
-        let n = socklen as usize;
-        let a = unsafe { core::slice::from_raw_parts(s_addr.cast::<u8>(), n) };
-        let b = unsafe { core::slice::from_raw_parts(sockaddr.cast::<u8>(), n) };
-        if a == b {
+        let haystack = unsafe { core::slice::from_raw_parts(slot.sockaddr.cast::<u8>(), n) };
+        if haystack == needle {
             return slot;
         }
     }
@@ -364,14 +529,28 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
 
         unsafe { peers_wlock(peers_ptr) };
 
+        let is_backup = peers_ptr != primary_peers;
+
         if !unsafe { (*peers_ptr).config }.is_null()
             && unsafe { (*rrp).config != *(*peers_ptr).config }
         {
-            unsafe { peers_wunlock(peers_ptr) };
-            return busy_with_primary_name(pc, primary_peers);
+            // Peer-list shifted under us. Resync if we have a slab
+            // pool (zone mode); otherwise bail busy and let nginx
+            // surface the error to the client.
+            if unsafe { (*cfg).shpool }.is_null()
+                || unsafe { resync_slots(cfg, peers_ptr, is_backup, now_msec) }.is_err()
+            {
+                unsafe { peers_wunlock(peers_ptr) };
+                return busy_with_primary_name(pc, primary_peers);
+            }
+            unsafe { (*rrp).config = *(*peers_ptr).config };
+            ngx_log_debug_mask!(
+                DebugMask::Http,
+                unsafe { (*pc).log },
+                "balancer_rs: get ewma peer, resynced slot table"
+            );
         }
 
-        let is_backup = peers_ptr != primary_peers;
         let (slots, slots_len) = unsafe {
             if is_backup {
                 ((*cfg).backup_slots, (*cfg).backup_len)
@@ -452,23 +631,35 @@ unsafe extern "C" fn free_peer(
         let failed = state & (NGX_PEER_FAILED as ngx_uint_t) != 0;
         let cfg = unsafe { (*our).config };
         let rrp = unsafe { (*our).rrp };
-        // Skip on stale config-generation: a zone-driven peer-list
-        // change between get and free could have shifted slot indices,
-        // and we'd otherwise write the RTT into a slot that now
-        // belongs to a different peer.
-        let stale = if cfg.is_null() || rrp.is_null() {
-            true
+        let primary = if cfg.is_null() {
+            ptr::null_mut()
         } else {
-            let primary = unsafe { (*cfg).primary_peers };
-            !primary.is_null()
-                && !unsafe { (*primary).config }.is_null()
-                && unsafe { (*rrp).config != *(*primary).config }
+            unsafe { (*cfg).primary_peers }
         };
+
+        // Take the peers wlock for the EWMA write so cross-worker
+        // reads in `peer.get` see a consistent slot. In non-zone
+        // mode this is a no-op (the helper gates on `peers->shpool`).
+        if !primary.is_null() {
+            unsafe { peers_wlock(primary) };
+        }
+
+        // Stale-check under lock: a resync between get and free
+        // would have either bumped `peers->config` or freed our
+        // `pick_slot`. Either way, skip the update.
+        let stale = primary.is_null()
+            || rrp.is_null()
+            || (!unsafe { (*primary).config }.is_null()
+                && unsafe { (*rrp).config != *(*primary).config });
 
         if !failed && !stale {
             let now_msec = unsafe { ngx_current_msec };
             let rtt_msec = now_msec.saturating_sub(unsafe { (*our).pick_start_msec });
             unsafe { ewma_update((*our).pick_slot, rtt_msec, now_msec) };
+        }
+
+        if !primary.is_null() {
+            unsafe { peers_wunlock(primary) };
         }
 
         // Clear the pick so a `proxy_next_upstream` retry doesn't
@@ -571,6 +762,115 @@ unsafe fn decay_score(slot: *mut EwmaSlot, now_msec: ngx_msec_t) -> f64 {
     let td = now_msec.saturating_sub(s.last_touched_msec);
     let weight = (-(td as f64) / DECAY_MSEC).exp();
     s.ewma * weight
+}
+
+/// Average decayed EWMA across slots that have at least one
+/// recorded sample (`last_touched_msec != 0`). Used as the
+/// slow-start seed for newly-appearing peers — keeps P2C from
+/// always-picking the new peer because its zero score makes it
+/// look "fastest." Returns 0.0 when no slot has been touched yet.
+#[allow(clippy::cast_precision_loss)]
+unsafe fn slow_start_mean(slots: *mut EwmaSlot, len: ngx_uint_t, now_msec: ngx_msec_t) -> f64 {
+    if slots.is_null() || len == 0 {
+        return 0.0;
+    }
+    let table = unsafe { core::slice::from_raw_parts(slots, len) };
+    let mut sum = 0.0f64;
+    let mut count = 0u64;
+    for s in table {
+        if s.last_touched_msec == 0 {
+            continue;
+        }
+        let td = now_msec.saturating_sub(s.last_touched_msec);
+        let weight = (-(td as f64) / DECAY_MSEC).exp();
+        sum += s.ewma * weight;
+        count += 1;
+    }
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
+/// Rebuild the slot table for `peers` (primary or backup) after a
+/// peers-list mutation. Surviving sockaddrs keep their EWMA + last
+/// touched time; new ones get seeded with
+/// `slow_start_mean(old_slots)` and `now`. Caller holds
+/// `peers->wlock`. Uses the suffix-free `ngx_slab_*` calls — those
+/// are the ones that take `shpool->mutex` internally, which is a
+/// different lock from `peers->wlock` and the only thing that
+/// keeps concurrent workers from corrupting the slab pool.
+unsafe fn resync_slots(
+    cfg: *mut EwmaConfig,
+    peers: *mut ngx_http_upstream_rr_peers_t,
+    is_backup: bool,
+    now_msec: ngx_msec_t,
+) -> Result<(), ()> {
+    let shpool = unsafe { (*cfg).shpool };
+    if shpool.is_null() {
+        return Err(());
+    }
+    let new_count = unsafe { (*peers).number };
+    let (old_slots, old_len) = unsafe {
+        if is_backup {
+            ((*cfg).backup_slots, (*cfg).backup_len)
+        } else {
+            ((*cfg).primary_slots, (*cfg).primary_len)
+        }
+    };
+
+    let mean = unsafe { slow_start_mean(old_slots, old_len, now_msec) };
+
+    let new_slots = if new_count == 0 {
+        ptr::null_mut()
+    } else {
+        let bytes = new_count.checked_mul(core::mem::size_of::<EwmaSlot>()).ok_or(())?;
+        let p = unsafe { ngx_slab_calloc(shpool, bytes) }.cast::<EwmaSlot>();
+        if p.is_null() {
+            return Err(());
+        }
+        p
+    };
+
+    let mut peer = unsafe { (*peers).peer };
+    let mut i: ngx_uint_t = 0;
+    while !peer.is_null() && i < new_count {
+        let new_slot = unsafe { new_slots.add(i) };
+        unsafe {
+            (*new_slot).sockaddr = (*peer).sockaddr;
+            (*new_slot).socklen = (*peer).socklen;
+        }
+
+        let old = unsafe {
+            find_slot_by_sockaddr(old_slots, old_len, (*peer).sockaddr, (*peer).socklen)
+        };
+        if !old.is_null() {
+            unsafe {
+                (*new_slot).ewma = (*old).ewma;
+                (*new_slot).last_touched_msec = (*old).last_touched_msec;
+            }
+        } else if mean > 0.0 {
+            unsafe {
+                (*new_slot).ewma = mean;
+                (*new_slot).last_touched_msec = now_msec;
+            }
+        }
+        peer = unsafe { (*peer).next };
+        i += 1;
+    }
+
+    if !old_slots.is_null() {
+        unsafe { ngx_slab_free(shpool, old_slots.cast()) };
+    }
+
+    unsafe {
+        if is_backup {
+            (*cfg).backup_slots = new_slots;
+            (*cfg).backup_len = new_count;
+        } else {
+            (*cfg).primary_peers = peers;
+            (*cfg).primary_slots = new_slots;
+            (*cfg).primary_len = new_count;
+        }
+    }
+    Ok(())
 }
 
 /// Apply the standard EWMA recurrence `ewma = ewma*w + rtt*(1-w)` in
