@@ -1,5 +1,7 @@
 # ngx-balancer-rs
 
+> Built end-to-end by coding agents as an AI-assisted experiment, and used for my own service. No warranties — use at your own risk.
+
 NGINX HTTP upstream balancer written in Rust, packaged as a dynamic
 module. Provides a single `balancer_rs <policy>;` directive inside an
 `upstream { … }` block.
