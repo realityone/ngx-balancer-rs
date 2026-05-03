@@ -21,12 +21,20 @@ cargo clippy --all-targets  # all + pedantic lints; project must stay clean
 tests/run.sh                # full end-to-end: build + Test::Nginx prove run
 tests/run.sh -v             # verbose prove output
 tests/run.sh tests/t/balancer_rs.t  # single .t file (any prove args pass through)
+tests/fuzz/run.sh           # chaos / fuzz harness (long-running; see tests/fuzz/README.md)
 ```
 
 `tests/run.sh` self-fetches `nginx-tests/lib` via sparse clone on first
 invocation and globs for the vendored nginx binary at
 `target/debug/build/nginx-sys-*/out/objs/nginx` (the hash changes when
 cargo redoes dependency resolution).
+
+`tests/fuzz/run.sh` reuses the same build/discovery logic but spawns
+chaos backends (random instant / slow / error / hang behavior) plus a
+Python asyncio fuzz client and watches the nginx error log for fatal
+markers. Knobs: `FUZZ_DURATION` (seconds, default 60), `FUZZ_CLIENTS`
+(concurrent workers, default 32), `FUZZ_SEED` (reproducible chaos),
+`FUZZ_KEEP=1` (keep `target/fuzz-prefix/` on success).
 
 ## Architecture
 

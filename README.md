@@ -73,3 +73,17 @@ tests/run.sh tests/t/balancer_rs.t      # one .t file (extra args pass through)
 
 The harness self-fetches the nginx-tests Perl library on first run and
 injects `load_module` for the freshly-built `.so` automatically.
+
+## Fuzz / chaos test
+
+```bash
+tests/fuzz/run.sh                       # default 60s soak, 32 concurrent clients
+FUZZ_DURATION=10 tests/fuzz/run.sh      # quick smoke
+```
+
+Spawns chaos HTTP backends (random instant/slow/error/hang behavior),
+starts an nginx with both `balancer_rs least_conn` and `balancer_rs ewma`
+upstreams, and drives concurrent randomized requests at it. Watches the
+error log for crashes / sanitizer hits / fatal markers. See
+[`tests/fuzz/README.md`](tests/fuzz/README.md) for the env-var knobs and
+pass criteria.
