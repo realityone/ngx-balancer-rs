@@ -45,7 +45,11 @@ unsafe extern "C" fn init_upstream(
     cf: *mut ngx_conf_t,
     us: *mut ngx_http_upstream_srv_conf_t,
 ) -> ngx_int_t {
-    ngx_log_debug_mask!(DebugMask::Http, unsafe { (*cf).log }, "init least conn");
+    ngx_log_debug_mask!(
+        DebugMask::Http,
+        unsafe { (*cf).log },
+        "balancer_rs: init least conn"
+    );
 
     if unsafe { ngx_http_upstream_init_round_robin(cf, us) } != Status::NGX_OK.into() {
         return Status::NGX_ERROR.into();
@@ -58,7 +62,7 @@ unsafe extern "C" fn init_upstream(
 http_upstream_init_peer_pt!(
     init_peer,
     |request: &mut Request, us: *mut ngx_http_upstream_srv_conf_t| {
-        ngx_log_debug_http!(request, "init least conn peer");
+        ngx_log_debug_http!(request, "balancer_rs: init least conn peer");
 
         if unsafe { ngx_http_upstream_init_round_robin_peer(request.into(), us) }
             != Status::NGX_OK.into()
@@ -92,7 +96,7 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
     ngx_log_debug_mask!(
         DebugMask::Http,
         unsafe { (*pc).log },
-        "get least conn peer, try: {}",
+        "balancer_rs: get least conn peer, try: {}",
         unsafe { (*pc).tries }
     );
 
@@ -149,7 +153,7 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
                 ngx_log_debug_mask!(
                     DebugMask::Http,
                     unsafe { (*pc).log },
-                    "get least conn peer, no peer found"
+                    "balancer_rs: get least conn peer, no peer found"
                 );
 
                 let next = unsafe { (*peers_ptr).next };
@@ -161,7 +165,7 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
                 ngx_log_debug_mask!(
                     DebugMask::Http,
                     unsafe { (*pc).log },
-                    "get least conn peer, backup servers"
+                    "balancer_rs: get least conn peer, backup servers"
                 );
 
                 // Switch to backup peers and zero the tried bitmap for
@@ -245,7 +249,7 @@ unsafe fn select_least_conn(
         ngx_log_debug_mask!(
             DebugMask::Http,
             unsafe { (*pc).log },
-            "get least conn peer, many"
+            "balancer_rs: get least conn peer, many"
         );
         let mut total: ngx_int_t = 0;
         peer = best;
