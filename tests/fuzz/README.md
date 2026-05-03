@@ -62,12 +62,13 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
   `/rr/`. Aggressive `proxy_*_timeout` so chaos hangs surface
   quickly. `proxy_next_upstream` set so failures exercise the
   retry path.
-- **`chaos_backend.py`** — aiohttp randomized HTTP listener seeded
-  per port. Each request rolls a die: 73% instant 200, 15% slow 200
-  (50–500 ms), 10% 502, 2% sleep 30 s (forces nginx upstream
-  timeout). Earlier malformed-framing branches (partial header /
-  partial body) were dropped when this moved off raw asyncio —
-  aiohttp's response writer always sends well-formed HTTP.
+- **`chaos_backend.py`** — raw-asyncio randomized HTTP listener
+  seeded per port. Each request rolls a die: 60% instant 200, 15%
+  slow 200 (50–500 ms), 10% 502, 8% partial-header close, 5%
+  partial-body close, 2% sleep 30 s (forces nginx upstream
+  timeout). Stays on `asyncio.start_server` rather than aiohttp so
+  it can emit deliberately malformed framing — aiohttp's response
+  writer is designed to prevent that.
 - **`fuzz_client.py`** — aiohttp client. Spawns `FUZZ_CLIENTS`
   workers; each loops, picking random method (GET/POST/HEAD),
   random path under `/lc/` or `/ewma/`, random body, random
