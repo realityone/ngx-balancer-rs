@@ -107,13 +107,14 @@ struct EwmaPeerData {
     config: *mut EwmaConfig,
     avail_buf: *mut AvailEntry,
     pick_valid: ngx_uint_t,
+    score_valid: ngx_uint_t,
     /// Direct pointer to the chosen peer's slot. Replaces the old
     /// `(pick_is_backup, pick_index)` pair — robust against future
     /// peer-list shifts (Phase 3) since slots are sockaddr-keyed.
     pick_slot: *mut EwmaSlot,
     pick_start_msec: ngx_msec_t,
     /// Decayed EWMA of the chosen peer at pick time, surfaced via
-    /// `$balancer_ewma_score`. Meaningful only when `pick_valid != 0`.
+    /// `$balancer_ewma_score`. Meaningful only when `score_valid != 0`.
     pick_score: f64,
 }
 
@@ -557,6 +558,7 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
         };
 
         our.pick_valid = 1;
+        our.score_valid = 1;
         our.pick_slot = chosen.slot;
         our.pick_start_msec = now_msec;
         our.pick_score = chosen_score;
@@ -625,7 +627,9 @@ unsafe extern "C" fn free_peer(
 
         // Clear the pick so a `proxy_next_upstream` retry doesn't
         // double-update if peer.free gets called again before the
-        // next peer.get.
+        // next peer.get. `score_valid` intentionally survives so
+        // `$balancer_ewma_score` can still be read by the access log
+        // after upstream finalization.
         our.pick_valid = 0;
     }
 
@@ -815,8 +819,8 @@ http_variable_get!(
             v.set_not_found(1);
             return Status::NGX_OK;
         };
-        if our.pick_valid == 0 {
-            // Single-peer fast path or no successful pick: no score.
+        if our.score_valid == 0 {
+            // Single-peer fast path or no EWMA pick: no score.
             v.set_not_found(1);
             return Status::NGX_OK;
         }

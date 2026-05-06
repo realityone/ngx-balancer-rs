@@ -67,4 +67,8 @@ export TEST_NGINX_GLOBALS="worker_rlimit_nofile $TEST_NGINX_NOFILE;
 load_module $MODULE_SO;"
 export TEST_NGINX_VERBOSE="${TEST_NGINX_VERBOSE:-1}"
 
-exec prove "$@" tests/t/
+if (($#)); then
+    exec prove "$@"
+else
+    exec prove tests/t/
+fi

@@ -84,13 +84,12 @@ cmp_ok(scalar(@scores), '>=', 8,
 
 my $bad = 0;
 for my $s (@scores) {
-    next if $s eq '-';                      # not_found → nginx logs '-'
     if ($s !~ /^\d+(?:\.\d+)?$/ || $s + 0 < 0) {
         diag("unexpected balancer_ewma_score value: $s");
         $bad++;
     }
 }
-is($bad, 0, "all scores parse as non-negative numbers (or '-' for not-found)");
+is($bad, 0, 'all scores parse as non-negative numbers');
 
 ###############################################################################
 
