@@ -59,7 +59,8 @@ impl SockaddrKey {
     }
 }
 
-type EwmaSlotIndex = RbTreeMap<SockaddrKey, *mut EwmaSlot, SlabPool>;
+type PoolEwmaSlotIndex = RbTreeMap<SockaddrKey, *mut EwmaSlot, Pool>;
+type SlabEwmaSlotIndex = RbTreeMap<SockaddrKey, *mut EwmaSlot, SlabPool>;
 
 /// Raw EWMA slot table owned by an nginx pool or slab pool.
 ///
@@ -67,16 +68,16 @@ type EwmaSlotIndex = RbTreeMap<SockaddrKey, *mut EwmaSlot, SlabPool>;
 /// but grouping it with `len` keeps callers from passing mismatched
 /// pointer/length pairs. Iteration-heavy code should use `as_slice`
 /// or `as_mut_slice` so slot table reads/writes look like normal
-/// slice access at the call site. In zone mode `index` points at a
-/// slab-backed `RbTreeMap` from copied sockaddr bytes to slot pointers;
-/// static upstreams leave it null and use the slice as the lookup
-/// source.
+/// slice access at the call site. `find_slot_by_sockaddr` always uses
+/// one of the rb-tree indexes; static upstreams use `pool_index`, and
+/// zone upstreams use `slab_index`.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub(super) struct EwmaSlotTable {
     ptr: *mut EwmaSlot,
     len: ngx_uint_t,
-    index: *mut EwmaSlotIndex,
+    pool_index: *mut PoolEwmaSlotIndex,
+    slab_index: *mut SlabEwmaSlotIndex,
 }
 
 impl EwmaSlotTable {
@@ -84,7 +85,8 @@ impl EwmaSlotTable {
         Self {
             ptr,
             len,
-            index: ptr::null_mut(),
+            pool_index: ptr::null_mut(),
+            slab_index: ptr::null_mut(),
         }
     }
 
@@ -92,8 +94,13 @@ impl EwmaSlotTable {
         Self::new(ptr::null_mut(), 0)
     }
 
-    fn with_index(mut self, index: *mut EwmaSlotIndex) -> Self {
-        self.index = index;
+    fn with_pool_index(mut self, index: *mut PoolEwmaSlotIndex) -> Self {
+        self.pool_index = index;
+        self
+    }
+
+    fn with_slab_index(mut self, index: *mut SlabEwmaSlotIndex) -> Self {
+        self.slab_index = index;
         self
     }
 
@@ -120,7 +127,7 @@ impl EwmaSlotTable {
     }
 
     pub(super) fn index_allocator(&self) -> Option<SlabPool> {
-        unsafe { self.index.as_ref() }.map(|index| index.allocator().clone())
+        unsafe { self.slab_index.as_ref() }.map(|index| index.allocator().clone())
     }
 
     pub(super) fn index_slot_at(
@@ -130,7 +137,29 @@ impl EwmaSlotTable {
         socklen: socklen_t,
     ) -> Result<(), ()> {
         let raw_slot = unsafe { self.ptr.add(i) };
-        index_slot(self.index, sockaddr, socklen, raw_slot)
+        index_slot(
+            self.pool_index,
+            self.slab_index,
+            sockaddr,
+            socklen,
+            raw_slot,
+        )
+    }
+
+    fn get_by_sockaddr(&self, sockaddr: *mut sockaddr, socklen: socklen_t) -> *mut EwmaSlot {
+        let Some(key) = SockaddrKey::from_raw(sockaddr, socklen) else {
+            return ptr::null_mut();
+        };
+
+        if let Some(index) = unsafe { self.pool_index.as_ref() } {
+            return index.get(&key).copied().unwrap_or(ptr::null_mut());
+        }
+
+        if let Some(index) = unsafe { self.slab_index.as_ref() } {
+            return index.get(&key).copied().unwrap_or(ptr::null_mut());
+        }
+
+        ptr::null_mut()
     }
 }
 
@@ -139,15 +168,16 @@ impl EwmaSlotTable {
 /// zero-length list yields a null pointer (callers must gate reads
 /// on `len > 0`).
 pub(super) fn alloc_slots(pool: &Pool, len: ngx_uint_t) -> Option<EwmaSlotTable> {
+    let index = alloc_pool_slot_index(pool)?;
     if len == 0 {
-        return Some(EwmaSlotTable::empty());
+        return Some(EwmaSlotTable::empty().with_pool_index(index));
     }
     let bytes = len.checked_mul(core::mem::size_of::<EwmaSlot>())?;
     let p = pool.calloc(bytes).cast::<EwmaSlot>();
     if p.is_null() {
         None
     } else {
-        Some(EwmaSlotTable::new(p, len))
+        Some(EwmaSlotTable::new(p, len).with_pool_index(index))
     }
 }
 
@@ -193,12 +223,12 @@ pub(super) unsafe fn alloc_indexed_slots_shpool_locked(
     alloc: &SlabPool,
     len: ngx_uint_t,
 ) -> Option<EwmaSlotTable> {
-    let index = alloc_slot_index(alloc)?;
+    let index = alloc_slab_slot_index(alloc)?;
     let Some(slots) = (unsafe { alloc_slots_shpool_locked(shpool, len) }) else {
-        free_slot_index(index);
+        free_slab_slot_index(index);
         return None;
     };
-    Some(slots.with_index(index))
+    Some(slots.with_slab_index(index))
 }
 
 pub(super) unsafe fn alloc_indexed_slots_shpool(
@@ -206,28 +236,36 @@ pub(super) unsafe fn alloc_indexed_slots_shpool(
     alloc: &SlabPool,
     len: ngx_uint_t,
 ) -> Option<EwmaSlotTable> {
-    let index = alloc_slot_index(alloc)?;
+    let index = alloc_slab_slot_index(alloc)?;
     let Some(slots) = (unsafe { alloc_slots_shpool(shpool, len) }) else {
-        free_slot_index(index);
+        free_slab_slot_index(index);
         return None;
     };
-    Some(slots.with_index(index))
+    Some(slots.with_slab_index(index))
 }
 
-fn alloc_slot_index(alloc: &SlabPool) -> Option<*mut EwmaSlotIndex> {
-    let map = EwmaSlotIndex::try_new_in(alloc.clone()).ok()?;
-    let layout = Layout::new::<EwmaSlotIndex>();
-    let ptr: NonNull<EwmaSlotIndex> = alloc.allocate_zeroed(layout).ok()?.cast();
+fn alloc_pool_slot_index(alloc: &Pool) -> Option<*mut PoolEwmaSlotIndex> {
+    let map = PoolEwmaSlotIndex::try_new_in(alloc.clone()).ok()?;
+    let layout = Layout::new::<PoolEwmaSlotIndex>();
+    let ptr: NonNull<PoolEwmaSlotIndex> = alloc.allocate_zeroed(layout).ok()?.cast();
     unsafe { ptr.as_ptr().write(map) };
     Some(ptr.as_ptr())
 }
 
-fn free_slot_index(index: *mut EwmaSlotIndex) {
+fn alloc_slab_slot_index(alloc: &SlabPool) -> Option<*mut SlabEwmaSlotIndex> {
+    let map = SlabEwmaSlotIndex::try_new_in(alloc.clone()).ok()?;
+    let layout = Layout::new::<SlabEwmaSlotIndex>();
+    let ptr: NonNull<SlabEwmaSlotIndex> = alloc.allocate_zeroed(layout).ok()?.cast();
+    unsafe { ptr.as_ptr().write(map) };
+    Some(ptr.as_ptr())
+}
+
+fn free_slab_slot_index(index: *mut SlabEwmaSlotIndex) {
     let Some(index_ref) = (unsafe { index.as_ref() }) else {
         return;
     };
     let alloc = index_ref.allocator().clone();
-    let layout = Layout::new::<EwmaSlotIndex>();
+    let layout = Layout::new::<SlabEwmaSlotIndex>();
     unsafe {
         ptr::drop_in_place(index);
         alloc.deallocate(NonNull::new_unchecked(index.cast::<u8>()), layout);
@@ -235,25 +273,32 @@ fn free_slot_index(index: *mut EwmaSlotIndex) {
 }
 
 pub(super) fn free_slab_slot_table(shpool: *mut ngx_slab_pool_t, slots: EwmaSlotTable) {
-    free_slot_index(slots.index);
+    free_slab_slot_index(slots.slab_index);
     if !slots.ptr.is_null() {
         unsafe { ngx_slab_free(shpool, slots.ptr.cast()) };
     }
 }
 
 fn index_slot(
-    index: *mut EwmaSlotIndex,
+    pool_index: *mut PoolEwmaSlotIndex,
+    slab_index: *mut SlabEwmaSlotIndex,
     sockaddr: *mut sockaddr,
     socklen: socklen_t,
     slot: *mut EwmaSlot,
 ) -> Result<(), ()> {
-    let Some(index) = (unsafe { index.as_mut() }) else {
-        return Ok(());
-    };
     let Some(key) = SockaddrKey::from_raw(sockaddr, socklen) else {
         return Err(());
     };
-    index.try_insert(key, slot).map(|_| ()).map_err(|_| ())
+
+    if let Some(index) = unsafe { pool_index.as_mut() } {
+        return index.try_insert(key, slot).map(|_| ()).map_err(|_| ());
+    }
+
+    if let Some(index) = unsafe { slab_index.as_mut() } {
+        return index.try_insert(key, slot).map(|_| ()).map_err(|_| ());
+    }
+
+    Err(())
 }
 
 /// Walk `peers` and copy each peer's `(sockaddr, socklen)` into the
@@ -267,7 +312,8 @@ pub(super) fn stamp_slot_identities(
 ) -> Result<(), ()> {
     let mut peer_ptr = peers.peer;
     let slots_base = slots.ptr;
-    let index = slots.index;
+    let pool_index = slots.pool_index;
+    let slab_index = slots.slab_index;
     for (i, slot) in slots.as_mut_slice().iter_mut().enumerate() {
         let Some(peer) = (unsafe { peer_ptr.as_ref() }) else {
             break;
@@ -275,42 +321,26 @@ pub(super) fn stamp_slot_identities(
         slot.sockaddr = peer.sockaddr;
         slot.socklen = peer.socklen;
         let raw_slot = unsafe { slots_base.add(i) };
-        index_slot(index, peer.sockaddr, peer.socklen, raw_slot)?;
+        index_slot(
+            pool_index,
+            slab_index,
+            peer.sockaddr,
+            peer.socklen,
+            raw_slot,
+        )?;
         peer_ptr = peer.next;
     }
     Ok(())
 }
 
-/// Find the slot owning `(sockaddr, socklen)`. Zone-mode tables use
-/// the slab-backed `RbTreeMap` index; static tables keep the older
-/// slice scan because they do not have a slab allocator.
+/// Find the slot owning `(sockaddr, socklen)` through the rb-tree
+/// index built when slot identities are stamped.
 pub(super) fn find_slot_by_sockaddr(
     slots: EwmaSlotTable,
     sockaddr: *mut sockaddr,
     socklen: socklen_t,
 ) -> *mut EwmaSlot {
-    let Some(key) = SockaddrKey::from_raw(sockaddr, socklen) else {
-        return ptr::null_mut();
-    };
-
-    if let Some(index) = unsafe { slots.index.as_ref() } {
-        return index.get(&key).copied().unwrap_or(ptr::null_mut());
-    }
-
-    let Ok(n) = usize::try_from(socklen) else {
-        return ptr::null_mut();
-    };
-    let needle = &key.bytes[..n];
-    for (i, slot) in slots.as_slice().iter().enumerate() {
-        if slot.sockaddr.is_null() || slot.socklen != socklen {
-            continue;
-        }
-        let haystack = unsafe { core::slice::from_raw_parts(slot.sockaddr.cast::<u8>(), n) };
-        if haystack == needle {
-            return unsafe { slots.ptr.add(i) };
-        }
-    }
-    ptr::null_mut()
+    slots.get_by_sockaddr(sockaddr, socklen)
 }
 
 /// Read `slot` and return its EWMA decayed forward to `now`. A null
