@@ -1,9 +1,10 @@
 #!/usr/bin/perl
 
-# EWMA recovery test with five peers. All peers start healthy, then
-# one backend begins sleeping long enough to violate the request SLA.
-# Once EWMA observes that slow sample, P2C should route around the
-# degraded peer and the aggregate latency should recover.
+# EWMA recovery test with five peers. Warmup makes the soon-to-be-bad
+# peer clearly fastest, then that backend begins sleeping long enough
+# to violate the request SLA. Once EWMA observes that slow sample, P2C
+# should route around the degraded peer and the aggregate latency should
+# recover.
 
 use warnings;
 use strict;
@@ -61,11 +62,15 @@ EOF
 
 diag('ewma recovery access log: ' . $t->testdir() . '/ewma_sla_recovery_access.log');
 
+my $favor_flag = $t->testdir() . '/favor-bad-peer';
 my $bad_flag = $t->testdir() . '/bad-peer-on';
 my $bad_port = port(8085);
 
+$t->write_file('favor-bad-peer', '1');
+
 for my $base (8081 .. 8085) {
-    $t->run_daemon(\&http_daemon, port($base), $bad_port, $bad_flag);
+    $t->run_daemon(\&http_daemon, port($base), $bad_port, $bad_flag,
+        $favor_flag);
 }
 
 $t->run();
@@ -82,6 +87,7 @@ is($ok, 50, 'ewma recovery: all warmup requests succeed across 5 peers');
 cmp_ok(scalar(keys %$seen), '>=', 4,
     'ewma recovery: healthy warmup reaches most peers');
 
+unlink $favor_flag or die "Can't remove $favor_flag: $!";
 $t->write_file('bad-peer-on', '1');
 
 my ($fault_seen, $fault_latency) = (0, 0);
@@ -151,7 +157,7 @@ sub percentile {
 }
 
 sub http_daemon {
-    my ($port, $bad_port, $bad_flag) = @_;
+    my ($port, $bad_port, $bad_flag, $favor_flag) = @_;
 
     my $server = IO::Socket::INET->new(
         Proto     => 'tcp',
@@ -170,7 +176,12 @@ sub http_daemon {
             last if (/^\x0d?\x0a?$/);
         }
 
-        my $delay = (-e $bad_flag && $port == $bad_port) ? 0.25 : 0;
+        my $delay = 0;
+        if (-e $bad_flag && $port == $bad_port) {
+            $delay = 0.25;
+        } elsif (-e $favor_flag && $port != $bad_port) {
+            $delay = 0.003;
+        }
         select undef, undef, undef, $delay if $delay;
 
         Test::Nginx::log_core('||', "$port: response, 200, delay=$delay");
