@@ -16,7 +16,7 @@
 
 mod slot;
 
-use core::{ffi::c_void, ptr};
+use core::{ffi::c_void, ptr, ptr::NonNull};
 
 use ngx::{
     core::{Pool, SlabPool, Status},
@@ -27,7 +27,7 @@ use ngx::{
         ngx_http_upstream_init_round_robin_peer, ngx_http_upstream_rr_peer_data_t,
         ngx_http_upstream_rr_peer_t, ngx_http_upstream_rr_peers_t, ngx_http_upstream_srv_conf_t,
         ngx_http_variable_t, ngx_int_t, ngx_module_t, ngx_msec_t, ngx_peer_connection_t,
-        ngx_random, ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_calloc_locked, ngx_slab_pool_t,
+        ngx_random, ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_alloc_locked, ngx_slab_pool_t,
         ngx_str_t, ngx_uint_t, ngx_variable_value_t, time_t, NGX_PEER_FAILED,
     },
     http::{HttpModuleServerConf, Request},
@@ -72,13 +72,35 @@ impl BalancingPolicy for Ewma {
 }
 
 #[derive(Clone, Copy)]
+#[repr(transparent)]
+struct PeersList {
+    ptr: NonNull<ngx_http_upstream_rr_peers_t>,
+}
+
+impl PeersList {
+    fn new(ptr: *mut ngx_http_upstream_rr_peers_t) -> Option<Self> {
+        NonNull::new(ptr).map(|ptr| Self { ptr })
+    }
+
+    fn from_mut(peers: &mut ngx_http_upstream_rr_peers_t) -> Self {
+        Self {
+            ptr: NonNull::from(peers),
+        }
+    }
+
+    fn as_ptr(self) -> *mut ngx_http_upstream_rr_peers_t {
+        self.ptr.as_ptr()
+    }
+}
+
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct EwmaConfig {
     /// Stable handle on the primary peers list. Needed in `peer.free`
     /// after a backup-fallback may have swapped `(*rrp).peers` to
     /// the backup list, so we can still reach `peers->config` to
     /// detect a zone-driven peer-list reload.
-    primary_peers: *mut ngx_http_upstream_rr_peers_t,
+    primary_peers: PeersList,
     primary_slots: EwmaSlotTable,
     backup_slots: EwmaSlotTable,
     /// Slab pool used for runtime slot-table reallocation during
@@ -155,6 +177,9 @@ fn init_upstream_static(cf: &mut ngx_conf_t, us: &mut ngx_http_upstream_srv_conf
     let Some(primary) = (unsafe { primary_ptr.as_ref() }) else {
         return Status::NGX_ERROR.into();
     };
+    let Some(primary_peers) = PeersList::new(primary_ptr) else {
+        return Status::NGX_ERROR.into();
+    };
     let pool = unsafe { Pool::from_ngx_pool(cf.pool) };
 
     let primary_len = primary.number;
@@ -180,14 +205,18 @@ fn init_upstream_static(cf: &mut ngx_conf_t, us: &mut ngx_http_upstream_srv_conf
         table
     };
 
-    let cfg = pool.calloc_type::<EwmaConfig>();
-    let Some(cfg_ref) = (unsafe { cfg.as_mut() }) else {
+    let cfg = pool.alloc_type::<EwmaConfig>();
+    if cfg.is_null() {
         return Status::NGX_ERROR.into();
-    };
-    cfg_ref.primary_peers = primary_ptr;
-    cfg_ref.primary_slots = primary_slots;
-    cfg_ref.backup_slots = backup_slots;
-    cfg_ref.shpool = ptr::null_mut();
+    }
+    unsafe {
+        cfg.write(EwmaConfig {
+            primary_peers,
+            primary_slots,
+            backup_slots,
+            shpool: ptr::null_mut(),
+        });
+    }
 
     let ccf = Balancer::server_conf_mut(us).expect("balancer_rs srv conf");
     match &mut ccf.policy {
@@ -294,6 +323,9 @@ unsafe extern "C" fn ewma_zone_init(
     let Some(primary) = (unsafe { primary_ptr.as_ref() }) else {
         return Status::NGX_ERROR.into();
     };
+    let Some(primary_peers) = PeersList::new(primary_ptr) else {
+        return Status::NGX_ERROR.into();
+    };
 
     // The slab pool is uncontended at zone-init time — master is the
     // only process touching it before workers fork — so the unlocked
@@ -330,28 +362,32 @@ unsafe extern "C" fn ewma_zone_init(
     };
 
     let cfg = unsafe {
-        ngx_slab_calloc_locked(shpool, core::mem::size_of::<EwmaConfig>()).cast::<EwmaConfig>()
+        ngx_slab_alloc_locked(shpool, core::mem::size_of::<EwmaConfig>()).cast::<EwmaConfig>()
     };
-    let Some(cfg_ref) = (unsafe { cfg.as_mut() }) else {
+    if cfg.is_null() {
         return Status::NGX_ERROR.into();
-    };
-    cfg_ref.primary_peers = primary_ptr;
-    cfg_ref.primary_slots = primary_slots;
-    cfg_ref.backup_slots = backup_slots;
-    cfg_ref.shpool = shpool;
+    }
+    unsafe {
+        cfg.write(EwmaConfig {
+            primary_peers,
+            primary_slots,
+            backup_slots,
+            shpool,
+        });
+    }
 
-    activate_ewma_config(us, cfg, primary_ptr)
+    activate_ewma_config(us, cfg, primary_peers)
 }
 
 fn activate_ewma_config(
     us: &mut ngx_http_upstream_srv_conf_t,
     cfg: *mut EwmaConfig,
-    primary_ptr: *mut ngx_http_upstream_rr_peers_t,
+    primary_peers: PeersList,
 ) -> ngx_int_t {
     let Some(cfg_ref) = (unsafe { cfg.as_mut() }) else {
         return Status::NGX_ERROR.into();
     };
-    cfg_ref.primary_peers = primary_ptr;
+    cfg_ref.primary_peers = primary_peers;
 
     // Stamp the EwmaConfig pointer onto the BalancerConfig before
     // fork. All workers will inherit the same value via fork CoW;
@@ -597,7 +633,7 @@ unsafe extern "C" fn free_peer(
         let failed = state & (NGX_PEER_FAILED as ngx_uint_t) != 0;
         let cfg = unsafe { our.config.as_ref() };
         let rrp = unsafe { our.rrp.as_ref() };
-        let primary_ptr = cfg.map_or(ptr::null_mut(), |cfg| cfg.primary_peers);
+        let primary_ptr = cfg.map_or(ptr::null_mut(), |cfg| cfg.primary_peers.as_ptr());
 
         if !primary_ptr.is_null() {
             // Hold the primary peers write lock while folding the
@@ -773,7 +809,7 @@ fn resync_slots(
     if is_backup {
         cfg.backup_slots = new_slots;
     } else {
-        cfg.primary_peers = ptr::from_mut(peers);
+        cfg.primary_peers = PeersList::from_mut(peers);
         cfg.primary_slots = new_slots;
     }
     free_slab_slot_table(shpool, old_slots);
