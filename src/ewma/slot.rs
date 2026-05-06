@@ -18,7 +18,7 @@ const DECAY_MSEC: f64 = 10_000.0;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub(super) struct EwmaSlot {
+pub(super) struct EwmaStatus {
     /// Identity of the peer this slot belongs to. Sockaddr is the
     /// stable key — peer linked-list positions shift when zone-driven
     /// peer churn removes entries (see
@@ -59,8 +59,8 @@ impl SockaddrKey {
     }
 }
 
-type PoolEwmaSlotIndex = RbTreeMap<SockaddrKey, *mut EwmaSlot, Pool>;
-type SlabEwmaSlotIndex = RbTreeMap<SockaddrKey, *mut EwmaSlot, SlabPool>;
+type PoolEwmaSlotIndex = RbTreeMap<SockaddrKey, *mut EwmaStatus, Pool>;
+type SlabEwmaSlotIndex = RbTreeMap<SockaddrKey, *mut EwmaStatus, SlabPool>;
 
 /// Raw EWMA slot table owned by an nginx pool or slab pool.
 ///
@@ -71,27 +71,30 @@ type SlabEwmaSlotIndex = RbTreeMap<SockaddrKey, *mut EwmaSlot, SlabPool>;
 /// slice access at the call site. `find_slot_by_sockaddr` always uses
 /// one of the rb-tree indexes; static upstreams use `pool_index`, and
 /// zone upstreams use `slab_index`.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub(super) struct EwmaSlotTable {
-    ptr: *mut EwmaSlot,
-    len: ngx_uint_t,
+    slots: NonNull<[EwmaStatus]>,
     pool_index: *mut PoolEwmaSlotIndex,
     slab_index: *mut SlabEwmaSlotIndex,
 }
 
 impl EwmaSlotTable {
-    pub(super) fn new(ptr: *mut EwmaSlot, len: ngx_uint_t) -> Self {
-        Self {
-            ptr,
-            len,
+    fn from_raw(ptr: *mut EwmaStatus, len: usize) -> Option<Self> {
+        let data = NonNull::new(ptr)?;
+        Some(Self {
+            slots: NonNull::slice_from_raw_parts(data, len),
             pool_index: ptr::null_mut(),
             slab_index: ptr::null_mut(),
-        }
+        })
     }
 
     pub(super) fn empty() -> Self {
-        Self::new(ptr::null_mut(), 0)
+        Self {
+            slots: NonNull::slice_from_raw_parts(NonNull::dangling(), 0),
+            pool_index: ptr::null_mut(),
+            slab_index: ptr::null_mut(),
+        }
     }
 
     fn with_pool_index(mut self, index: *mut PoolEwmaSlotIndex) -> Self {
@@ -105,24 +108,18 @@ impl EwmaSlotTable {
     }
 
     pub(super) fn len(&self) -> ngx_uint_t {
-        self.len
+        self.as_slice().len()
     }
 
-    fn as_slice(&self) -> &[EwmaSlot] {
-        if self.ptr.is_null() || self.len == 0 {
-            return &[];
-        }
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    fn as_slice(&self) -> &[EwmaStatus] {
+        unsafe { self.slots.as_ref() }
     }
 
-    pub(super) fn as_mut_slice(&mut self) -> &mut [EwmaSlot] {
-        if self.ptr.is_null() || self.len == 0 {
-            return &mut [];
-        }
-        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    pub(super) fn as_mut_slice(&mut self) -> &mut [EwmaStatus] {
+        unsafe { self.slots.as_mut() }
     }
 
-    pub(super) fn get_mut(&mut self, i: usize) -> Option<&mut EwmaSlot> {
+    pub(super) fn get_mut(&mut self, i: usize) -> Option<&mut EwmaStatus> {
         self.as_mut_slice().get_mut(i)
     }
 
@@ -136,7 +133,10 @@ impl EwmaSlotTable {
         sockaddr: *mut sockaddr,
         socklen: socklen_t,
     ) -> Result<(), ()> {
-        let raw_slot = unsafe { self.ptr.add(i) };
+        let Some(slot) = self.as_slice().get(i) else {
+            return Err(());
+        };
+        let raw_slot = ptr::from_ref(slot).cast_mut();
         index_slot(
             self.pool_index,
             self.slab_index,
@@ -146,7 +146,7 @@ impl EwmaSlotTable {
         )
     }
 
-    fn get_by_sockaddr(&self, sockaddr: *mut sockaddr, socklen: socklen_t) -> *mut EwmaSlot {
+    fn get_by_sockaddr(&self, sockaddr: *mut sockaddr, socklen: socklen_t) -> *mut EwmaStatus {
         let Some(key) = SockaddrKey::from_raw(sockaddr, socklen) else {
             return ptr::null_mut();
         };
@@ -163,7 +163,7 @@ impl EwmaSlotTable {
     }
 }
 
-/// Allocate a zero-initialized `EwmaSlot` array from `pool`. Returns
+/// Allocate a zero-initialized `EwmaStatus` array from `pool`. Returns
 /// `None` only when the allocation fails for a non-zero count; a
 /// zero-length list yields a null pointer (callers must gate reads
 /// on `len > 0`).
@@ -172,16 +172,16 @@ pub(super) fn alloc_slots(pool: &Pool, len: ngx_uint_t) -> Option<EwmaSlotTable>
     if len == 0 {
         return Some(EwmaSlotTable::empty().with_pool_index(index));
     }
-    let bytes = len.checked_mul(core::mem::size_of::<EwmaSlot>())?;
-    let p = pool.calloc(bytes).cast::<EwmaSlot>();
+    let bytes = len.checked_mul(core::mem::size_of::<EwmaStatus>())?;
+    let p = pool.calloc(bytes).cast::<EwmaStatus>();
     if p.is_null() {
         None
     } else {
-        Some(EwmaSlotTable::new(p, len).with_pool_index(index))
+        Some(EwmaSlotTable::from_raw(p, len)?.with_pool_index(index))
     }
 }
 
-/// Slab-allocate a zero-initialized `EwmaSlot` array. Caller is
+/// Slab-allocate a zero-initialized `EwmaStatus` array. Caller is
 /// responsible for ensuring the slab pool is either uncontended
 /// (zone init) or that `shpool->mutex` is held (runtime resync).
 unsafe fn alloc_slots_shpool_locked(
@@ -191,16 +191,16 @@ unsafe fn alloc_slots_shpool_locked(
     if len == 0 {
         return Some(EwmaSlotTable::empty());
     }
-    let bytes = len.checked_mul(core::mem::size_of::<EwmaSlot>())?;
-    let p = unsafe { ngx_slab_calloc_locked(shpool, bytes) }.cast::<EwmaSlot>();
+    let bytes = len.checked_mul(core::mem::size_of::<EwmaStatus>())?;
+    let p = unsafe { ngx_slab_calloc_locked(shpool, bytes) }.cast::<EwmaStatus>();
     if p.is_null() {
         None
     } else {
-        Some(EwmaSlotTable::new(p, len))
+        Some(EwmaSlotTable::from_raw(p, len)?)
     }
 }
 
-/// Slab-allocate a zero-initialized `EwmaSlot` array using the normal
+/// Slab-allocate a zero-initialized `EwmaStatus` array using the normal
 /// slab allocator entry point, which takes `shpool->mutex` internally.
 unsafe fn alloc_slots_shpool(
     shpool: *mut ngx_slab_pool_t,
@@ -209,12 +209,12 @@ unsafe fn alloc_slots_shpool(
     if len == 0 {
         return Some(EwmaSlotTable::empty());
     }
-    let bytes = len.checked_mul(core::mem::size_of::<EwmaSlot>())?;
-    let p = unsafe { ngx_slab_calloc(shpool, bytes) }.cast::<EwmaSlot>();
+    let bytes = len.checked_mul(core::mem::size_of::<EwmaStatus>())?;
+    let p = unsafe { ngx_slab_calloc(shpool, bytes) }.cast::<EwmaStatus>();
     if p.is_null() {
         None
     } else {
-        Some(EwmaSlotTable::new(p, len))
+        Some(EwmaSlotTable::from_raw(p, len)?)
     }
 }
 
@@ -274,8 +274,9 @@ fn free_slab_slot_index(index: *mut SlabEwmaSlotIndex) {
 
 pub(super) fn free_slab_slot_table(shpool: *mut ngx_slab_pool_t, slots: EwmaSlotTable) {
     free_slab_slot_index(slots.slab_index);
-    if !slots.ptr.is_null() {
-        unsafe { ngx_slab_free(shpool, slots.ptr.cast()) };
+    if slots.len() != 0 {
+        let ptr = slots.as_slice().as_ptr().cast_mut();
+        unsafe { ngx_slab_free(shpool, ptr.cast()) };
     }
 }
 
@@ -284,7 +285,7 @@ fn index_slot(
     slab_index: *mut SlabEwmaSlotIndex,
     sockaddr: *mut sockaddr,
     socklen: socklen_t,
-    slot: *mut EwmaSlot,
+    slot: *mut EwmaStatus,
 ) -> Result<(), ()> {
     let Some(key) = SockaddrKey::from_raw(sockaddr, socklen) else {
         return Err(());
@@ -311,16 +312,15 @@ pub(super) fn stamp_slot_identities(
     slots: &mut EwmaSlotTable,
 ) -> Result<(), ()> {
     let mut peer_ptr = peers.peer;
-    let slots_base = slots.ptr;
     let pool_index = slots.pool_index;
     let slab_index = slots.slab_index;
-    for (i, slot) in slots.as_mut_slice().iter_mut().enumerate() {
+    for slot in slots.as_mut_slice() {
         let Some(peer) = (unsafe { peer_ptr.as_ref() }) else {
             break;
         };
         slot.sockaddr = peer.sockaddr;
         slot.socklen = peer.socklen;
-        let raw_slot = unsafe { slots_base.add(i) };
+        let raw_slot = ptr::from_mut(slot);
         index_slot(
             pool_index,
             slab_index,
@@ -339,14 +339,14 @@ pub(super) fn find_slot_by_sockaddr(
     slots: EwmaSlotTable,
     sockaddr: *mut sockaddr,
     socklen: socklen_t,
-) -> *mut EwmaSlot {
+) -> *mut EwmaStatus {
     slots.get_by_sockaddr(sockaddr, socklen)
 }
 
 /// Read `slot` and return its EWMA decayed forward to `now`. A null
 /// pointer or a freshly-zeroed slot scores 0.
 #[allow(clippy::cast_precision_loss)]
-pub(super) fn decay_score(slot: *mut EwmaSlot, now_msec: ngx_msec_t) -> f64 {
+pub(super) fn decay_score(slot: *mut EwmaStatus, now_msec: ngx_msec_t) -> f64 {
     if slot.is_null() {
         return 0.0;
     }
@@ -384,7 +384,7 @@ pub(super) fn slow_start_mean(slots: EwmaSlotTable, now_msec: ngx_msec_t) -> f64
 /// Apply the standard EWMA recurrence `ewma = ewma*w + rtt*(1-w)` in
 /// place, with `w = exp(-td/DECAY)`. Bumps `last_touched_msec` to now.
 #[allow(clippy::cast_precision_loss)]
-pub(super) fn ewma_update(slot: *mut EwmaSlot, rtt_msec: ngx_msec_t, now_msec: ngx_msec_t) {
+pub(super) fn ewma_update(slot: *mut EwmaStatus, rtt_msec: ngx_msec_t, now_msec: ngx_msec_t) {
     if slot.is_null() {
         return;
     }

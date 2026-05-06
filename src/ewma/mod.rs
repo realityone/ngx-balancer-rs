@@ -8,7 +8,7 @@
 //! score; the winner's EWMA is updated when the request completes.
 //!
 //! State lives in nginx-owned memory: static upstreams allocate their
-//! `EwmaSlot` tables from `cf->pool`, while zone upstreams keep slot
+//! `EwmaStatus` tables from `cf->pool`, while zone upstreams keep slot
 //! tables plus sockaddr indexes in our private EWMA slab zone. Each
 //! request still gets a wrapper around `round_robin`'s `rr_peer_data_t`
 //! from `r->pool`. EWMA history does not survive a config reload —
@@ -48,7 +48,7 @@ use crate::{
 use self::slot::{
     alloc_indexed_slots_shpool, alloc_indexed_slots_shpool_locked, alloc_slots, decay_score,
     ewma_update, find_slot_by_sockaddr, free_slab_slot_table, slow_start_mean,
-    stamp_slot_identities, EwmaSlot, EwmaSlotTable,
+    stamp_slot_identities, EwmaSlotTable, EwmaStatus,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -119,7 +119,7 @@ struct EwmaConfig {
 struct AvailEntry {
     peer: *mut ngx_http_upstream_rr_peer_t,
     peer_index: ngx_uint_t,
-    slot: *mut EwmaSlot,
+    slot: *mut EwmaStatus,
 }
 
 #[derive(Clone, Copy)]
@@ -133,7 +133,7 @@ struct EwmaPeerData {
     /// Direct pointer to the chosen peer's slot. Replaces the old
     /// `(pick_is_backup, pick_index)` pair — robust against future
     /// peer-list shifts (Phase 3) since slots are sockaddr-keyed.
-    pick_slot: *mut EwmaSlot,
+    pick_slot: *mut EwmaStatus,
     pick_start_msec: ngx_msec_t,
     /// Decayed EWMA of the chosen peer at pick time, surfaced via
     /// `$balancer_ewma_score`. Meaningful only when `score_valid != 0`.
