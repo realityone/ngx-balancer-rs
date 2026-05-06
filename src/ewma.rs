@@ -86,6 +86,44 @@ struct EwmaSlot {
     last_touched_msec: ngx_msec_t,
 }
 
+/// Raw EWMA slot table owned by an nginx pool or slab pool.
+///
+/// The pointer remains raw because nginx owns the allocation lifetime,
+/// but grouping it with `len` keeps callers from passing mismatched
+/// pointer/length pairs. Iteration-heavy code should use `as_slice`
+/// or `as_mut_slice` so slot table reads/writes look like normal
+/// slice access at the call site.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct EwmaSlotTable {
+    ptr: *mut EwmaSlot,
+    len: ngx_uint_t,
+}
+
+impl EwmaSlotTable {
+    fn new(ptr: *mut EwmaSlot, len: ngx_uint_t) -> Self {
+        Self { ptr, len }
+    }
+
+    fn empty() -> Self {
+        Self::new(ptr::null_mut(), 0)
+    }
+
+    fn as_slice(&self) -> &[EwmaSlot] {
+        if self.ptr.is_null() || self.len == 0 {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [EwmaSlot] {
+        if self.ptr.is_null() || self.len == 0 {
+            return &mut [];
+        }
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct EwmaConfig {
@@ -94,10 +132,8 @@ struct EwmaConfig {
     /// the backup list, so we can still reach `peers->config` to
     /// detect a zone-driven peer-list reload.
     primary_peers: *mut ngx_http_upstream_rr_peers_t,
-    primary_slots: *mut EwmaSlot,
-    primary_len: ngx_uint_t,
-    backup_slots: *mut EwmaSlot,
-    backup_len: ngx_uint_t,
+    primary_slots: EwmaSlotTable,
+    backup_slots: EwmaSlotTable,
     /// Slab pool used for runtime slot-table reallocation during
     /// dynamic resync. Null in non-zone mode (where peer churn
     /// can't happen — `peers->config` is null and never increments).
@@ -181,22 +217,22 @@ fn init_upstream_static(cf: &mut ngx_conf_t, us: &mut ngx_http_upstream_srv_conf
     let pool = unsafe { Pool::from_ngx_pool(cf.pool) };
 
     let primary_len = primary.number;
-    let Some(primary_slots) = alloc_slots(&pool, primary_len) else {
+    let Some(mut primary_slots) = alloc_slots(&pool, primary_len) else {
         return Status::NGX_ERROR.into();
     };
-    stamp_slot_identities(primary, primary_slots, primary_len);
+    stamp_slot_identities(primary, &mut primary_slots);
 
     let backup_ptr = primary.next;
-    let (backup_len, backup_slots) = if backup_ptr.is_null() {
-        (0, ptr::null_mut())
+    let backup_slots = if backup_ptr.is_null() {
+        EwmaSlotTable::empty()
     } else {
         let backup = unsafe { &*backup_ptr };
         let n = backup.number;
-        let Some(p) = alloc_slots(&pool, n) else {
+        let Some(mut table) = alloc_slots(&pool, n) else {
             return Status::NGX_ERROR.into();
         };
-        stamp_slot_identities(backup, p, n);
-        (n, p)
+        stamp_slot_identities(backup, &mut table);
+        table
     };
 
     let cfg = pool.calloc_type::<EwmaConfig>();
@@ -205,9 +241,7 @@ fn init_upstream_static(cf: &mut ngx_conf_t, us: &mut ngx_http_upstream_srv_conf
     };
     cfg_ref.primary_peers = primary_ptr;
     cfg_ref.primary_slots = primary_slots;
-    cfg_ref.primary_len = primary_len;
     cfg_ref.backup_slots = backup_slots;
-    cfg_ref.backup_len = backup_len;
     cfg_ref.shpool = ptr::null_mut();
 
     let ccf = Balancer::server_conf_mut(us).expect("balancer_rs srv conf");
@@ -300,24 +334,23 @@ unsafe extern "C" fn ewma_zone_init(zone: *mut ngx_shm_zone_t, _data: *mut c_voi
     // only process touching it before workers fork — so the unlocked
     // `_locked` variants are safe (they skip taking shpool->mutex).
     let primary_len = primary.number;
-    let primary_slots = unsafe { alloc_slots_shpool(shpool, primary_len) };
-    if primary_slots.is_null() && primary_len > 0 {
+    let Some(mut primary_slots) = (unsafe { alloc_slots_shpool_locked(shpool, primary_len) })
+    else {
         return Status::NGX_ERROR.into();
-    }
-    stamp_slot_identities(primary, primary_slots, primary_len);
+    };
+    stamp_slot_identities(primary, &mut primary_slots);
 
     let backup_ptr = primary.next;
-    let (backup_len, backup_slots) = if backup_ptr.is_null() {
-        (0, ptr::null_mut())
+    let backup_slots = if backup_ptr.is_null() {
+        EwmaSlotTable::empty()
     } else {
         let backup = unsafe { &*backup_ptr };
         let n = backup.number;
-        let p = unsafe { alloc_slots_shpool(shpool, n) };
-        if p.is_null() && n > 0 {
+        let Some(mut table) = (unsafe { alloc_slots_shpool_locked(shpool, n) }) else {
             return Status::NGX_ERROR.into();
-        }
-        stamp_slot_identities(backup, p, n);
-        (n, p)
+        };
+        stamp_slot_identities(backup, &mut table);
+        table
     };
 
     let cfg = unsafe {
@@ -328,9 +361,7 @@ unsafe extern "C" fn ewma_zone_init(zone: *mut ngx_shm_zone_t, _data: *mut c_voi
     };
     cfg_ref.primary_peers = primary_ptr;
     cfg_ref.primary_slots = primary_slots;
-    cfg_ref.primary_len = primary_len;
     cfg_ref.backup_slots = backup_slots;
-    cfg_ref.backup_len = backup_len;
     cfg_ref.shpool = shpool;
 
     // Stamp the EwmaConfig pointer onto the BalancerConfig before
@@ -348,28 +379,36 @@ unsafe extern "C" fn ewma_zone_init(zone: *mut ngx_shm_zone_t, _data: *mut c_voi
 /// Slab-allocate a zero-initialized `EwmaSlot` array. Caller is
 /// responsible for ensuring the slab pool is either uncontended
 /// (zone init) or that `shpool->mutex` is held (runtime resync).
-unsafe fn alloc_slots_shpool(shpool: *mut ngx_slab_pool_t, len: ngx_uint_t) -> *mut EwmaSlot {
+unsafe fn alloc_slots_shpool_locked(
+    shpool: *mut ngx_slab_pool_t,
+    len: ngx_uint_t,
+) -> Option<EwmaSlotTable> {
     if len == 0 {
-        return ptr::null_mut();
+        return Some(EwmaSlotTable::empty());
     }
     let bytes = len.saturating_mul(core::mem::size_of::<EwmaSlot>());
-    unsafe { ngx_slab_calloc_locked(shpool, bytes) }.cast::<EwmaSlot>()
+    let p = unsafe { ngx_slab_calloc_locked(shpool, bytes) }.cast::<EwmaSlot>();
+    if p.is_null() {
+        None
+    } else {
+        Some(EwmaSlotTable::new(p, len))
+    }
 }
 
 /// Allocate a zero-initialized `EwmaSlot` array from `pool`. Returns
 /// `None` only when the allocation fails for a non-zero count; a
 /// zero-length list yields a null pointer (callers must gate reads
 /// on `len > 0`).
-fn alloc_slots(pool: &Pool, len: ngx_uint_t) -> Option<*mut EwmaSlot> {
+fn alloc_slots(pool: &Pool, len: ngx_uint_t) -> Option<EwmaSlotTable> {
     if len == 0 {
-        return Some(ptr::null_mut());
+        return Some(EwmaSlotTable::empty());
     }
     let bytes = len.checked_mul(core::mem::size_of::<EwmaSlot>())?;
     let p = pool.calloc(bytes).cast::<EwmaSlot>();
     if p.is_null() {
         None
     } else {
-        Some(p)
+        Some(EwmaSlotTable::new(p, len))
     }
 }
 
@@ -378,26 +417,15 @@ fn alloc_slots(pool: &Pool, len: ngx_uint_t) -> Option<*mut EwmaSlot> {
 /// churn (Phase 3) shifts linked-list positions, slots are looked
 /// up by sockaddr instead, so this initial alignment doesn't have
 /// to hold forever.
-fn stamp_slot_identities(
-    peers: &ngx_http_upstream_rr_peers_t,
-    slots: *mut EwmaSlot,
-    len: ngx_uint_t,
-) {
-    if slots.is_null() {
-        return;
-    }
+fn stamp_slot_identities(peers: &ngx_http_upstream_rr_peers_t, slots: &mut EwmaSlotTable) {
     let mut peer_ptr = peers.peer;
-    let mut i: ngx_uint_t = 0;
-    while let Some(peer) = unsafe { peer_ptr.as_ref() } {
-        if i >= len {
+    for slot in slots.as_mut_slice() {
+        let Some(peer) = (unsafe { peer_ptr.as_ref() }) else {
             break;
-        }
-        unsafe {
-            (*slots.add(i)).sockaddr = peer.sockaddr;
-            (*slots.add(i)).socklen = peer.socklen;
-        }
+        };
+        slot.sockaddr = peer.sockaddr;
+        slot.socklen = peer.socklen;
         peer_ptr = peer.next;
-        i += 1;
     }
 }
 
@@ -405,24 +433,22 @@ fn stamp_slot_identities(
 /// null if nothing matches. O(N) per call; fleets are typically
 /// <100 peers so this is fine.
 fn find_slot_by_sockaddr(
-    slots: *mut EwmaSlot,
-    len: ngx_uint_t,
+    slots: EwmaSlotTable,
     sockaddr: *mut sockaddr,
     socklen: socklen_t,
 ) -> *mut EwmaSlot {
-    if slots.is_null() || sockaddr.is_null() || socklen == 0 {
+    if sockaddr.is_null() || socklen == 0 {
         return ptr::null_mut();
     }
-    let table = unsafe { core::slice::from_raw_parts_mut(slots, len) };
     let n = socklen as usize;
     let needle = unsafe { core::slice::from_raw_parts(sockaddr.cast::<u8>(), n) };
-    for slot in table {
+    for (i, slot) in slots.as_slice().iter().enumerate() {
         if slot.sockaddr.is_null() || slot.socklen != socklen {
             continue;
         }
         let haystack = unsafe { core::slice::from_raw_parts(slot.sockaddr.cast::<u8>(), n) };
         if haystack == needle {
-            return slot;
+            return unsafe { slots.ptr.add(i) };
         }
     }
     ptr::null_mut()
@@ -470,7 +496,7 @@ http_upstream_init_peer_pt!(
             return Status::NGX_ERROR;
         };
 
-        let cap = cfg_ref.primary_len.max(cfg_ref.backup_len);
+        let cap = avail_cap(cfg_ref);
         let avail_buf = if cap == 0 {
             ptr::null_mut()
         } else {
@@ -574,9 +600,9 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
             );
         }
 
-        let (slots, slots_len) = slots_for(cfg, is_backup);
+        let slots = slots_for(cfg, is_backup);
 
-        let count = collect_available(rrp, peers, now_sec, our, slots, slots_len);
+        let count = collect_available(rrp, peers, now_sec, our, slots);
 
         if count == 0 {
             ngx_log_debug_mask!(
@@ -627,11 +653,11 @@ unsafe extern "C" fn get_peer(pc: *mut ngx_peer_connection_t, data: *mut c_void)
     }
 }
 
-fn slots_for(cfg: &EwmaConfig, is_backup: bool) -> (*mut EwmaSlot, ngx_uint_t) {
+fn slots_for(cfg: &EwmaConfig, is_backup: bool) -> EwmaSlotTable {
     if is_backup {
-        (cfg.backup_slots, cfg.backup_len)
+        cfg.backup_slots
     } else {
-        (cfg.primary_slots, cfg.primary_len)
+        cfg.primary_slots
     }
 }
 
@@ -705,8 +731,7 @@ fn collect_available(
     peers: &ngx_http_upstream_rr_peers_t,
     now_sec: time_t,
     our: &mut EwmaPeerData,
-    slots: *mut EwmaSlot,
-    slots_len: ngx_uint_t,
+    slots: EwmaSlotTable,
 ) -> ngx_uint_t {
     let buf = our.avail_buf;
     let cap = unsafe { our.config.as_ref() }.map_or(0, avail_cap);
@@ -722,7 +747,7 @@ fn collect_available(
             break;
         }
         if peer_available_ref(rrp, peer, index, now_sec) {
-            let slot = find_slot_by_sockaddr(slots, slots_len, peer.sockaddr, peer.socklen);
+            let slot = find_slot_by_sockaddr(slots, peer.sockaddr, peer.socklen);
             unsafe {
                 *buf.add(count) = AvailEntry {
                     peer: peer_ptr,
@@ -739,7 +764,7 @@ fn collect_available(
 }
 
 fn avail_cap(cfg: &EwmaConfig) -> ngx_uint_t {
-    cfg.primary_len.max(cfg.backup_len)
+    cfg.primary_slots.len.max(cfg.backup_slots.len)
 }
 
 /// Sample two distinct positions from `[0, count)` and return the
@@ -786,14 +811,10 @@ fn decay_score(slot: *mut EwmaSlot, now_msec: ngx_msec_t) -> f64 {
 /// always-picking the new peer because its zero score makes it
 /// look "fastest." Returns 0.0 when no slot has been touched yet.
 #[allow(clippy::cast_precision_loss)]
-fn slow_start_mean(slots: *mut EwmaSlot, len: ngx_uint_t, now_msec: ngx_msec_t) -> f64 {
-    if slots.is_null() || len == 0 {
-        return 0.0;
-    }
-    let table = unsafe { core::slice::from_raw_parts(slots, len) };
+fn slow_start_mean(slots: EwmaSlotTable, now_msec: ngx_msec_t) -> f64 {
     let mut sum = 0.0f64;
     let mut count = 0u64;
-    for s in table {
+    for s in slots.as_slice() {
         if s.last_touched_msec == 0 {
             continue;
         }
@@ -828,16 +849,12 @@ fn resync_slots(
         return Err(());
     }
     let new_count = peers.number;
-    let (old_slots, old_len) = if is_backup {
-        (cfg.backup_slots, cfg.backup_len)
-    } else {
-        (cfg.primary_slots, cfg.primary_len)
-    };
+    let old_slots = slots_for(cfg, is_backup);
 
-    let mean = slow_start_mean(old_slots, old_len, now_msec);
+    let mean = slow_start_mean(old_slots, now_msec);
 
-    let new_slots = if new_count == 0 {
-        ptr::null_mut()
+    let mut new_slots = if new_count == 0 {
+        EwmaSlotTable::empty()
     } else {
         let bytes = new_count
             .checked_mul(core::mem::size_of::<EwmaSlot>())
@@ -846,48 +863,39 @@ fn resync_slots(
         if p.is_null() {
             return Err(());
         }
-        p
+        EwmaSlotTable::new(p, new_count)
     };
 
     let mut peer_ptr = peers.peer;
-    let mut i: ngx_uint_t = 0;
-    while let Some(peer) = unsafe { peer_ptr.as_ref() } {
-        if i >= new_count {
+    for new_slot in new_slots.as_mut_slice() {
+        let Some(peer) = (unsafe { peer_ptr.as_ref() }) else {
             break;
-        }
-        let new_slot = unsafe { new_slots.add(i) };
-        unsafe {
-            (*new_slot).sockaddr = peer.sockaddr;
-            (*new_slot).socklen = peer.socklen;
-        }
+        };
+        new_slot.sockaddr = peer.sockaddr;
+        new_slot.socklen = peer.socklen;
 
-        let old = find_slot_by_sockaddr(old_slots, old_len, peer.sockaddr, peer.socklen);
+        let old = find_slot_by_sockaddr(old_slots, peer.sockaddr, peer.socklen);
         if !old.is_null() {
             unsafe {
-                (*new_slot).ewma = (*old).ewma;
-                (*new_slot).last_touched_msec = (*old).last_touched_msec;
+                new_slot.ewma = (*old).ewma;
+                new_slot.last_touched_msec = (*old).last_touched_msec;
             }
         } else if mean > 0.0 {
-            unsafe {
-                (*new_slot).ewma = mean;
-                (*new_slot).last_touched_msec = now_msec;
-            }
+            new_slot.ewma = mean;
+            new_slot.last_touched_msec = now_msec;
         }
         peer_ptr = peer.next;
-        i += 1;
     }
 
-    if !old_slots.is_null() {
-        unsafe { ngx_slab_free(shpool, old_slots.cast()) };
+    if !old_slots.ptr.is_null() {
+        unsafe { ngx_slab_free(shpool, old_slots.ptr.cast()) };
     }
 
     if is_backup {
         cfg.backup_slots = new_slots;
-        cfg.backup_len = new_count;
     } else {
         cfg.primary_peers = ptr::from_mut(peers);
         cfg.primary_slots = new_slots;
-        cfg.primary_len = new_count;
     }
     Ok(())
 }
