@@ -7,17 +7,19 @@
 //! two random eligible peers and route to the one with the lower
 //! score; the winner's EWMA is updated when the request completes.
 //!
-//! State lives in our own heap allocations: per-cycle `EwmaSlot`
-//! tables hung off `BalancerConfig.ewma` (allocated from `cf->pool`
-//! during `init_upstream`), plus a per-request wrapper around
-//! `round_robin`'s `rr_peer_data_t` (allocated from `r->pool`).
-//! EWMA history is per worker process and does not survive a config
-//! reload — out of scope for v1.
+//! State lives in nginx-owned memory: static upstreams allocate their
+//! `EwmaSlot` tables from `cf->pool`, while zone upstreams keep slot
+//! tables plus sockaddr indexes in our private EWMA slab zone. Each
+//! request still gets a wrapper around `round_robin`'s `rr_peer_data_t`
+//! from `r->pool`. EWMA history does not survive a config reload —
+//! out of scope for v1.
 
-use core::{ffi::c_void, ptr};
+use core::{alloc::Layout, ffi::c_void, ptr, ptr::NonNull};
 
 use ngx::{
-    core::{Pool, Status},
+    allocator::Allocator,
+    collections::RbTreeMap,
+    core::{Pool, SlabPool, Status},
     ffi::{
         ngx_cached_time, ngx_conf_t, ngx_current_msec, ngx_http_add_variable,
         ngx_http_upstream_free_round_robin_peer, ngx_http_upstream_get_round_robin_peer,
@@ -27,7 +29,7 @@ use ngx::{
         ngx_http_variable_t, ngx_int_t, ngx_module_t, ngx_msec_t, ngx_peer_connection_t,
         ngx_random, ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_calloc, ngx_slab_calloc_locked,
         ngx_slab_free, ngx_slab_pool_t, ngx_str_t, ngx_uint_t, ngx_variable_value_t, sockaddr,
-        socklen_t, time_t, NGX_PEER_FAILED,
+        sockaddr_storage, socklen_t, time_t, NGX_PEER_FAILED,
     },
     http::{HttpModuleServerConf, Request},
     http_upstream_init_peer_pt, http_variable_get, ngx_log_debug_http, ngx_log_debug_mask,
@@ -86,27 +88,70 @@ struct EwmaSlot {
     last_touched_msec: ngx_msec_t,
 }
 
+const SOCKADDR_KEY_BYTES: usize = core::mem::size_of::<sockaddr_storage>();
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+struct SockaddrKey {
+    len: socklen_t,
+    bytes: [u8; SOCKADDR_KEY_BYTES],
+}
+
+impl SockaddrKey {
+    fn from_raw(sockaddr: *mut sockaddr, socklen: socklen_t) -> Option<Self> {
+        if sockaddr.is_null() || socklen == 0 {
+            return None;
+        }
+
+        let len = usize::try_from(socklen).ok()?;
+        if len > SOCKADDR_KEY_BYTES {
+            return None;
+        }
+
+        let mut bytes = [0u8; SOCKADDR_KEY_BYTES];
+        unsafe { ptr::copy_nonoverlapping(sockaddr.cast::<u8>(), bytes.as_mut_ptr(), len) };
+        Some(Self {
+            len: socklen,
+            bytes,
+        })
+    }
+}
+
+type EwmaSlotIndex = RbTreeMap<SockaddrKey, *mut EwmaSlot, SlabPool>;
+
 /// Raw EWMA slot table owned by an nginx pool or slab pool.
 ///
 /// The pointer remains raw because nginx owns the allocation lifetime,
 /// but grouping it with `len` keeps callers from passing mismatched
 /// pointer/length pairs. Iteration-heavy code should use `as_slice`
 /// or `as_mut_slice` so slot table reads/writes look like normal
-/// slice access at the call site.
+/// slice access at the call site. In zone mode `index` points at a
+/// slab-backed `RbTreeMap` from copied sockaddr bytes to slot pointers;
+/// static upstreams leave it null and use the slice as the lookup
+/// source.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct EwmaSlotTable {
     ptr: *mut EwmaSlot,
     len: ngx_uint_t,
+    index: *mut EwmaSlotIndex,
 }
 
 impl EwmaSlotTable {
     fn new(ptr: *mut EwmaSlot, len: ngx_uint_t) -> Self {
-        Self { ptr, len }
+        Self {
+            ptr,
+            len,
+            index: ptr::null_mut(),
+        }
     }
 
     fn empty() -> Self {
         Self::new(ptr::null_mut(), 0)
+    }
+
+    fn with_index(mut self, index: *mut EwmaSlotIndex) -> Self {
+        self.index = index;
+        self
     }
 
     fn as_slice(&self) -> &[EwmaSlot] {
@@ -170,13 +215,6 @@ struct EwmaPeerData {
     pick_score: f64,
 }
 
-/// Hard-coded size of the per-upstream shm zone we register in
-/// zone mode. Holds `EwmaConfig` + slot tables + slab allocator
-/// metadata + headroom for resync churn. ~64 KB is enough for
-/// fleets up to a few hundred peers; configurable would be cleaner
-/// but is deferred.
-const EWMA_ZONE_SIZE: usize = 64 * 1024;
-
 unsafe extern "C" fn init_upstream(
     cf: *mut ngx_conf_t,
     us: *mut ngx_http_upstream_srv_conf_t,
@@ -220,7 +258,9 @@ fn init_upstream_static(cf: &mut ngx_conf_t, us: &mut ngx_http_upstream_srv_conf
     let Some(mut primary_slots) = alloc_slots(&pool, primary_len) else {
         return Status::NGX_ERROR.into();
     };
-    stamp_slot_identities(primary, &mut primary_slots);
+    if stamp_slot_identities(primary, &mut primary_slots).is_err() {
+        return Status::NGX_ERROR.into();
+    }
 
     let backup_ptr = primary.next;
     let backup_slots = if backup_ptr.is_null() {
@@ -231,7 +271,9 @@ fn init_upstream_static(cf: &mut ngx_conf_t, us: &mut ngx_http_upstream_srv_conf
         let Some(mut table) = alloc_slots(&pool, n) else {
             return Status::NGX_ERROR.into();
         };
-        stamp_slot_identities(backup, &mut table);
+        if stamp_slot_identities(backup, &mut table).is_err() {
+            return Status::NGX_ERROR.into();
+        }
         table
     };
 
@@ -263,6 +305,13 @@ const ZONE_NAME_PREFIX: &[u8] = b"balancer_rs_ewma_";
 /// shared memory and survive into every forked worker.
 fn register_ewma_zone(cf: &mut ngx_conf_t, us: &mut ngx_http_upstream_srv_conf_t) -> ngx_int_t {
     let pool = unsafe { Pool::from_ngx_pool(cf.pool) };
+    let Some(upstream_zone) = (unsafe { us.shm_zone.as_ref() }) else {
+        return Status::NGX_ERROR.into();
+    };
+    let zone_size = upstream_zone.shm.size;
+    if zone_size == 0 {
+        return Status::NGX_ERROR.into();
+    }
 
     let host_len = us.host.len;
     let host_data = us.host.data;
@@ -288,19 +337,21 @@ fn register_ewma_zone(cf: &mut ngx_conf_t, us: &mut ngx_http_upstream_srv_conf_t
 
     let module_ptr: *const ngx_module_t = &raw const crate::ngx_http_balancer_rs_module;
     let cf_ptr = ptr::from_mut(cf);
-    let shm_zone = unsafe {
-        ngx_shared_memory_add(
-            cf_ptr,
-            name_ptr,
-            EWMA_ZONE_SIZE,
-            module_ptr.cast_mut().cast(),
-        )
-    };
+    let shm_zone =
+        unsafe { ngx_shared_memory_add(cf_ptr, name_ptr, zone_size, module_ptr.cast_mut().cast()) };
     let Some(shm_zone) = (unsafe { shm_zone.as_mut() }) else {
         return Status::NGX_ERROR.into();
     };
     shm_zone.init = Some(ewma_zone_init);
+    // `ewma_zone_init` receives only the zone pointer for the current
+    // cycle, so stash the current upstream srv-conf here long enough
+    // for init to find `us->peer.data`.
     shm_zone.data = ptr::from_mut(us).cast::<c_void>();
+    // The EWMA config stores pointers into the current cycle's
+    // upstream peer zone. Allocate a fresh private EWMA zone on reload
+    // so new workers get tables stamped against the new peer list while
+    // old workers keep using the old mapping until they exit.
+    shm_zone.noreuse = 1;
     Status::NGX_OK.into()
 }
 
@@ -308,7 +359,10 @@ fn register_ewma_zone(cf: &mut ngx_conf_t, us: &mut ngx_http_upstream_srv_conf_t
 /// the `round_robin` zone module's init has copied peers into the
 /// upstream's own shpool — so `(*us).peer.data` now points at the
 /// shpool peers list and we can walk it to size + stamp our slots.
-unsafe extern "C" fn ewma_zone_init(zone: *mut ngx_shm_zone_t, _data: *mut c_void) -> ngx_int_t {
+unsafe extern "C" fn ewma_zone_init(
+    zone: *mut ngx_shm_zone_t,
+    _old_data: *mut c_void,
+) -> ngx_int_t {
     let Some(zone) = (unsafe { zone.as_mut() }) else {
         return Status::NGX_ERROR.into();
     };
@@ -316,6 +370,11 @@ unsafe extern "C" fn ewma_zone_init(zone: *mut ngx_shm_zone_t, _data: *mut c_voi
     let Some(us) = (unsafe { us_ptr.as_mut() }) else {
         return Status::NGX_ERROR.into();
     };
+    // The current upstream pointer was only a bootstrap value for this
+    // init call. Clear it after use so future reload logic cannot grow
+    // a second state handoff path through `shm_zone->data`.
+    zone.data = ptr::null_mut();
+
     // `shm.addr` is `*mut u_char` (align 1), but every shared zone
     // begins with a page-aligned `ngx_slab_pool_t` header — alignment
     // is guaranteed by nginx, so silence the strict-alignment lint.
@@ -324,6 +383,9 @@ unsafe extern "C" fn ewma_zone_init(zone: *mut ngx_shm_zone_t, _data: *mut c_voi
     if shpool.is_null() {
         return Status::NGX_ERROR.into();
     }
+    let Some(slot_alloc) = (unsafe { SlabPool::from_shm_zone(zone) }) else {
+        return Status::NGX_ERROR.into();
+    };
 
     let primary_ptr = us.peer.data.cast::<ngx_http_upstream_rr_peers_t>();
     let Some(primary) = (unsafe { primary_ptr.as_ref() }) else {
@@ -338,18 +400,30 @@ unsafe extern "C" fn ewma_zone_init(zone: *mut ngx_shm_zone_t, _data: *mut c_voi
     else {
         return Status::NGX_ERROR.into();
     };
-    stamp_slot_identities(primary, &mut primary_slots);
+    let Some(primary_index) = alloc_slot_index(&slot_alloc) else {
+        return Status::NGX_ERROR.into();
+    };
+    primary_slots = primary_slots.with_index(primary_index);
+    if stamp_slot_identities(primary, &mut primary_slots).is_err() {
+        return Status::NGX_ERROR.into();
+    }
 
     let backup_ptr = primary.next;
+    let Some(backup_index) = alloc_slot_index(&slot_alloc) else {
+        return Status::NGX_ERROR.into();
+    };
     let backup_slots = if backup_ptr.is_null() {
-        EwmaSlotTable::empty()
+        EwmaSlotTable::empty().with_index(backup_index)
     } else {
         let backup = unsafe { &*backup_ptr };
         let n = backup.number;
         let Some(mut table) = (unsafe { alloc_slots_shpool_locked(shpool, n) }) else {
             return Status::NGX_ERROR.into();
         };
-        stamp_slot_identities(backup, &mut table);
+        table = table.with_index(backup_index);
+        if stamp_slot_identities(backup, &mut table).is_err() {
+            return Status::NGX_ERROR.into();
+        }
         table
     };
 
@@ -364,16 +438,31 @@ unsafe extern "C" fn ewma_zone_init(zone: *mut ngx_shm_zone_t, _data: *mut c_voi
     cfg_ref.backup_slots = backup_slots;
     cfg_ref.shpool = shpool;
 
+    activate_ewma_config(us, cfg, primary_ptr)
+}
+
+fn activate_ewma_config(
+    us: &mut ngx_http_upstream_srv_conf_t,
+    cfg: *mut EwmaConfig,
+    primary_ptr: *mut ngx_http_upstream_rr_peers_t,
+) -> ngx_int_t {
+    let Some(cfg_ref) = (unsafe { cfg.as_mut() }) else {
+        return Status::NGX_ERROR.into();
+    };
+    cfg_ref.primary_peers = primary_ptr;
+
     // Stamp the EwmaConfig pointer onto the BalancerConfig before
     // fork. All workers will inherit the same value via fork CoW;
     // since the EwmaConfig itself lives in shared memory, every
     // worker dereferences to the same physical pages.
     let ccf = Balancer::server_conf_mut(us).expect("balancer_rs srv conf");
     match &mut ccf.policy {
-        PolicyImpl::Ewma(state) => state.config = cfg,
-        _ => return Status::NGX_ERROR.into(),
+        PolicyImpl::Ewma(state) => {
+            state.config = cfg;
+            Status::NGX_OK.into()
+        }
+        _ => Status::NGX_ERROR.into(),
     }
-    Status::NGX_OK.into()
 }
 
 /// Slab-allocate a zero-initialized `EwmaSlot` array. Caller is
@@ -412,36 +501,93 @@ fn alloc_slots(pool: &Pool, len: ngx_uint_t) -> Option<EwmaSlotTable> {
     }
 }
 
+fn alloc_slot_index(alloc: &SlabPool) -> Option<*mut EwmaSlotIndex> {
+    let map = EwmaSlotIndex::try_new_in(alloc.clone()).ok()?;
+    let layout = Layout::new::<EwmaSlotIndex>();
+    let ptr: NonNull<EwmaSlotIndex> = alloc.allocate_zeroed(layout).ok()?.cast();
+    unsafe { ptr.as_ptr().write(map) };
+    Some(ptr.as_ptr())
+}
+
+fn free_slot_index(index: *mut EwmaSlotIndex) {
+    let Some(index_ref) = (unsafe { index.as_ref() }) else {
+        return;
+    };
+    let alloc = index_ref.allocator().clone();
+    let layout = Layout::new::<EwmaSlotIndex>();
+    unsafe {
+        ptr::drop_in_place(index);
+        alloc.deallocate(NonNull::new_unchecked(index.cast::<u8>()), layout);
+    }
+}
+
+fn free_slab_slot_table(shpool: *mut ngx_slab_pool_t, slots: EwmaSlotTable) {
+    free_slot_index(slots.index);
+    if !slots.ptr.is_null() {
+        unsafe { ngx_slab_free(shpool, slots.ptr.cast()) };
+    }
+}
+
+fn index_slot(
+    index: *mut EwmaSlotIndex,
+    sockaddr: *mut sockaddr,
+    socklen: socklen_t,
+    slot: *mut EwmaSlot,
+) -> Result<(), ()> {
+    let Some(index) = (unsafe { index.as_mut() }) else {
+        return Ok(());
+    };
+    let Some(key) = SockaddrKey::from_raw(sockaddr, socklen) else {
+        return Err(());
+    };
+    index.try_insert(key, slot).map(|_| ()).map_err(|_| ())
+}
+
 /// Walk `peers` and copy each peer's `(sockaddr, socklen)` into the
 /// matching slot. Slots and peers are 1:1 at init time; once peer
 /// churn (Phase 3) shifts linked-list positions, slots are looked
-/// up by sockaddr instead, so this initial alignment doesn't have
-/// to hold forever.
-fn stamp_slot_identities(peers: &ngx_http_upstream_rr_peers_t, slots: &mut EwmaSlotTable) {
+/// up by sockaddr through the optional slab-backed index, so this
+/// initial alignment doesn't have to hold forever.
+fn stamp_slot_identities(
+    peers: &ngx_http_upstream_rr_peers_t,
+    slots: &mut EwmaSlotTable,
+) -> Result<(), ()> {
     let mut peer_ptr = peers.peer;
-    for slot in slots.as_mut_slice() {
+    let slots_base = slots.ptr;
+    let index = slots.index;
+    for (i, slot) in slots.as_mut_slice().iter_mut().enumerate() {
         let Some(peer) = (unsafe { peer_ptr.as_ref() }) else {
             break;
         };
         slot.sockaddr = peer.sockaddr;
         slot.socklen = peer.socklen;
+        let raw_slot = unsafe { slots_base.add(i) };
+        index_slot(index, peer.sockaddr, peer.socklen, raw_slot)?;
         peer_ptr = peer.next;
     }
+    Ok(())
 }
 
-/// Linear scan for the slot owning `(sockaddr, socklen)`. Returns
-/// null if nothing matches. O(N) per call; fleets are typically
-/// <100 peers so this is fine.
+/// Find the slot owning `(sockaddr, socklen)`. Zone-mode tables use
+/// the slab-backed `RbTreeMap` index; static tables keep the older
+/// slice scan because they do not have a slab allocator.
 fn find_slot_by_sockaddr(
     slots: EwmaSlotTable,
     sockaddr: *mut sockaddr,
     socklen: socklen_t,
 ) -> *mut EwmaSlot {
-    if sockaddr.is_null() || socklen == 0 {
+    let Some(key) = SockaddrKey::from_raw(sockaddr, socklen) else {
         return ptr::null_mut();
+    };
+
+    if let Some(index) = unsafe { slots.index.as_ref() } {
+        return index.get(&key).copied().unwrap_or(ptr::null_mut());
     }
-    let n = socklen as usize;
-    let needle = unsafe { core::slice::from_raw_parts(sockaddr.cast::<u8>(), n) };
+
+    let Ok(n) = usize::try_from(socklen) else {
+        return ptr::null_mut();
+    };
+    let needle = &key.bytes[..n];
     for (i, slot) in slots.as_slice().iter().enumerate() {
         if slot.sockaddr.is_null() || slot.socklen != socklen {
             continue;
@@ -850,24 +996,34 @@ fn resync_slots(
     }
     let new_count = peers.number;
     let old_slots = slots_for(cfg, is_backup);
+    let Some(old_index) = (unsafe { old_slots.index.as_ref() }) else {
+        return Err(());
+    };
+    let Some(new_index) = alloc_slot_index(old_index.allocator()) else {
+        return Err(());
+    };
 
     let mean = slow_start_mean(old_slots, now_msec);
 
     let mut new_slots = if new_count == 0 {
-        EwmaSlotTable::empty()
+        EwmaSlotTable::empty().with_index(new_index)
     } else {
-        let bytes = new_count
-            .checked_mul(core::mem::size_of::<EwmaSlot>())
-            .ok_or(())?;
+        let Some(bytes) = new_count.checked_mul(core::mem::size_of::<EwmaSlot>()) else {
+            free_slot_index(new_index);
+            return Err(());
+        };
         let p = unsafe { ngx_slab_calloc(shpool, bytes) }.cast::<EwmaSlot>();
         if p.is_null() {
+            free_slot_index(new_index);
             return Err(());
         }
-        EwmaSlotTable::new(p, new_count)
+        EwmaSlotTable::new(p, new_count).with_index(new_index)
     };
 
     let mut peer_ptr = peers.peer;
-    for new_slot in new_slots.as_mut_slice() {
+    let new_slots_base = new_slots.ptr;
+    let new_slots_index = new_slots.index;
+    for (i, new_slot) in new_slots.as_mut_slice().iter_mut().enumerate() {
         let Some(peer) = (unsafe { peer_ptr.as_ref() }) else {
             break;
         };
@@ -884,11 +1040,12 @@ fn resync_slots(
             new_slot.ewma = mean;
             new_slot.last_touched_msec = now_msec;
         }
+        let raw_new_slot = unsafe { new_slots_base.add(i) };
+        if index_slot(new_slots_index, peer.sockaddr, peer.socklen, raw_new_slot).is_err() {
+            free_slab_slot_table(shpool, new_slots);
+            return Err(());
+        }
         peer_ptr = peer.next;
-    }
-
-    if !old_slots.ptr.is_null() {
-        unsafe { ngx_slab_free(shpool, old_slots.ptr.cast()) };
     }
 
     if is_backup {
@@ -897,6 +1054,7 @@ fn resync_slots(
         cfg.primary_peers = ptr::from_mut(peers);
         cfg.primary_slots = new_slots;
     }
+    free_slab_slot_table(shpool, old_slots);
     Ok(())
 }
 

@@ -28,7 +28,7 @@ use Test::Nginx;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(2);
+my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(4);
 
 $t->write_file_expand('nginx.conf', <<'EOF');
 
@@ -70,19 +70,39 @@ $t->waitforsocket('127.0.0.1:' . port(8082));
 
 ###############################################################################
 
-my $ok = 0;
-my %seen;
-for (1 .. 16) {
-    my $resp = http_get('/');
-    $ok++ if $resp =~ m{^HTTP/1\.1 200};
-    $seen{$1}++ if $resp =~ /X-Port: (\d+)/;
-}
+my ($ok, $seen) = request_batch(16);
 
 is($ok, 16, 'ewma zone-mode: 16/16 sequential requests succeed');
-cmp_ok(scalar(keys %seen), '>=', 1,
+cmp_ok(scalar(keys %$seen), '>=', 1,
     'ewma zone-mode: at least one peer served traffic');
 
+$t->reload();
+
+# Give the master a short window to process HUP and run the new cycle's
+# zone init callback before the post-reload traffic assertions.
+select undef, undef, undef, 0.2;
+
+($ok, $seen) = request_batch(16);
+
+is($ok, 16, 'ewma zone-mode: 16/16 requests succeed after reload');
+cmp_ok(scalar(keys %$seen), '>=', 1,
+    'ewma zone-mode: at least one peer served traffic after reload');
+
 ###############################################################################
+
+sub request_batch {
+    my ($count) = @_;
+
+    my $ok = 0;
+    my %seen;
+    for (1 .. $count) {
+        my $resp = http_get('/');
+        $ok++ if $resp =~ m{^HTTP/1\.1 200};
+        $seen{$1}++ if $resp =~ /X-Port: (\d+)/;
+    }
+
+    return ($ok, \%seen);
+}
 
 sub http_daemon {
     my ($port) = @_;
